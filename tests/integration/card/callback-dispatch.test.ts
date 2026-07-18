@@ -6,6 +6,7 @@ import { PendingQueue } from '../../../src/bot/pending-queue.js';
 import { CallbackAuth } from '../../../src/card/callback-auth.js';
 import { CallbackNonceStore } from '../../../src/card/callback-store.js';
 import { handleCardAction } from '../../../src/card/dispatcher.js';
+import { codexThreadDeepLink } from '../../../src/card/codex-link.js';
 import type { Controls } from '../../../src/commands/index.js';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
 import { SessionStore } from '../../../src/session/store.js';
@@ -113,6 +114,19 @@ describe('signed card callback dispatch', () => {
     expect(activeRun.stopped).toBe(false);
     expect(h.pending.cancel('oc_group')).toHaveLength(0);
   });
+
+  it('opens only validated Codex thread ids through the local desktop opener', async () => {
+    const h = await createHarness({ agentKind: 'codex' });
+
+    await h.dispatch({ cmd: 'codex.open', bridge_token: h.codexToken('thread-1', 'nonce-open-1') });
+    await h.dispatch({
+      cmd: 'codex.open',
+      bridge_token: h.codexToken('codex://threads/unsafe', 'nonce-open-unsafe'),
+    });
+    await h.dispatch({ cmd: 'codex.open', bridge_token: 'forged' });
+
+    expect(h.openedCodexThreads).toEqual(['thread-1']);
+  });
 });
 
 type Harness = {
@@ -125,15 +139,21 @@ type Harness = {
   controls: Controls;
   pending: PendingQueue;
   auth: CallbackAuth;
+  openedCodexThreads: string[];
   dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<void>;
   token(
     action: string,
     overrides?: { operatorOpenId?: string; nonce?: string; scope?: string },
   ): string;
+  codexToken(threadId: string, nonce?: string): string;
 };
 
 async function createHarness(
-  opts: { callbackAuth?: boolean; chatMode?: 'p2p' | 'group' | 'topic' } = {},
+  opts: {
+    callbackAuth?: boolean;
+    chatMode?: 'p2p' | 'group' | 'topic';
+    agentKind?: 'claude' | 'codex';
+  } = {},
 ): Promise<Harness> {
   const tmp = await createTmpProfile('callback-dispatch-test-');
   const channel = createFakeChannel();
@@ -141,6 +161,8 @@ async function createHarness(
   const workspaces = new WorkspaceStore(`${tmp.profile}/workspaces.json`);
   const activeRuns = new ActiveRuns();
   const agent = new FakeAgentAdapter();
+  if (opts.agentKind === 'codex') Object.defineProperty(agent, 'id', { value: 'codex' });
+  const openedCodexThreads: string[] = [];
   const pending = new PendingQueue(60_000, () => {});
   const store = new CallbackNonceStore(`${tmp.profile}/callback-nonces.json`);
   const controls = {
@@ -189,6 +211,7 @@ async function createHarness(
     controls,
     pending,
     auth,
+    openedCodexThreads,
     token: (action, overrides = {}) => {
       nonce = overrides.nonce ?? `nonce-${action}`;
       return auth.sign({
@@ -197,6 +220,17 @@ async function createHarness(
         chatId: 'oc_group',
         operatorOpenId: overrides.operatorOpenId ?? 'ou_operator',
         action,
+        policyFingerprint: 'fp-1',
+        ttlMs: 60_000,
+      });
+    },
+    codexToken: (threadId, tokenNonce = `nonce-open-${threadId}`) => {
+      nonce = tokenNonce;
+      return auth.signCodexOpen({
+        scope: 'oc_group',
+        chatId: 'oc_group',
+        operatorOpenId: 'ou_operator',
+        threadId,
         policyFingerprint: 'fp-1',
         ttlMs: 60_000,
       });
@@ -214,6 +248,11 @@ async function createHarness(
         chatModeCache,
         ...(opts.callbackAuth === false ? {} : { callbackAuth: auth }),
         callbackPolicyFingerprint: 'fp-1',
+        openCodexThread: async (threadId) => {
+          // Production validates inside the desktop opener before spawning.
+          codexThreadDeepLink(threadId);
+          openedCodexThreads.push(threadId);
+        },
       }),
   };
 }

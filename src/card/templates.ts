@@ -1,7 +1,14 @@
+import { tryCodexThreadDeepLink } from './codex-link';
+
 interface ButtonSpec {
   text: string;
-  value: Record<string, unknown>;
+  value?: Record<string, unknown>;
+  url?: string;
   style?: 'primary' | 'danger' | 'default';
+}
+
+export interface CodexOpenRenderOptions {
+  signCodexOpen?: (threadId: string) => string;
 }
 
 function button(spec: ButtonSpec): object {
@@ -9,7 +16,8 @@ function button(spec: ButtonSpec): object {
     tag: 'button',
     text: { tag: 'plain_text', content: spec.text },
     type: spec.style ?? 'default',
-    value: spec.value,
+    ...(spec.value ? { value: spec.value } : {}),
+    ...(spec.url ? { url: spec.url } : {}),
   };
 }
 
@@ -65,6 +73,7 @@ export interface StatusInfo {
   profileName: string;
   cwd?: string;
   sessionId?: string;
+  codexThreadId?: string;
   emptySessionText?: string;
   sessionStale: boolean;
   agentName: string;
@@ -82,9 +91,18 @@ export interface StatusInfo {
   scope: string;
   /** Chat mode — used to label scope. */
   chatMode: 'p2p' | 'group' | 'topic';
+  groupContext?: {
+    status: 'full' | 'truncated' | 'degraded';
+    messageCount: number;
+    charCount: number;
+    reason?: string;
+  };
 }
 
-export function statusCard(info: StatusInfo): object {
+export function statusCard(info: StatusInfo, options: CodexOpenRenderOptions = {}): object {
+  const codexThreadId = tryCodexThreadDeepLink(info.codexThreadId)
+    ? info.codexThreadId
+    : undefined;
   const sessionLine = info.sessionId
     ? `\`${info.sessionId.slice(0, 8)}…\`${info.sessionStale ? ' ⚠️ 旧 cwd，下一条会新建' : ''}`
     : (info.emptySessionText ?? '(无)');
@@ -119,11 +137,19 @@ export function statusCard(info: StatusInfo): object {
       : []),
     `🚦 **queue**: ${queueLine}`,
     `👤 **owner API**: ${escapeMd(info.ownerState)}`,
+    ...(info.groupContext
+      ? [
+          `💬 **group context**: ${info.groupContext.status} · ${info.groupContext.messageCount} msgs · ${info.groupContext.charCount} chars${info.groupContext.reason ? ` · ${escapeMd(info.groupContext.reason)}` : ''}`,
+        ]
+      : []),
   ];
   return shell('📊 当前状态', [
     divMd(lines.join('\n')),
     HR,
     actions([
+      ...(codexThreadId
+        ? [codexOpenButtonSpec(codexThreadId, options)]
+        : []),
       { text: '🆕 新会话', value: { cmd: 'new' }, style: 'primary' },
       { text: '🔁 恢复会话', value: { cmd: 'resume' } },
       { text: '📂 工作目录', value: { cmd: 'ws.list' } },
@@ -140,9 +166,14 @@ export interface ResumeEntry {
   lineCount?: number;
   detail?: string;
   current?: boolean;
+  codexThreadId?: string;
 }
 
-export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
+export function resumeCard(
+  cwd: string,
+  entries: ResumeEntry[],
+  options: CodexOpenRenderOptions = {},
+): object {
   const elements: object[] = [];
   elements.push(divMd(`当前 cwd：\`${escapeCode(cwd)}\``));
 
@@ -154,6 +185,9 @@ export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
 
   elements.push(HR);
   entries.forEach((e, i) => {
+    const codexThreadId = tryCodexThreadDeepLink(e.codexThreadId)
+      ? e.codexThreadId
+      : undefined;
     const marker = e.current ? '  ← 当前' : '';
     const detail = e.detail ?? `${e.lineCount ?? 0} 条`;
     const displayId = e.displayId ?? e.sessionId;
@@ -169,12 +203,25 @@ export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
           value: { cmd: 'resume.use', arg: e.sessionId },
           style: e.current ? 'default' : 'primary',
         },
+        ...(codexThreadId
+          ? [codexOpenButtonSpec(codexThreadId, options)]
+          : []),
       ]),
     );
     if (i < entries.length - 1) elements.push(HR);
   });
 
   return shell('🔁 恢复历史会话', elements);
+}
+
+function codexOpenButtonSpec(
+  threadId: string,
+  options: CodexOpenRenderOptions,
+): ButtonSpec {
+  const token = options.signCodexOpen?.(threadId);
+  return token
+    ? { text: '在 Codex 中打开', value: { cmd: 'codex.open', bridge_token: token } }
+    : { text: '在 Codex 中打开', url: tryCodexThreadDeepLink(threadId) };
 }
 
 export function helpCard(agentName = 'Agent'): object {

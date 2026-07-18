@@ -16,6 +16,9 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
 - **Images and files**: send them to the bot directly, and the bridge downloads them locally for the agent.
 - **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
+- **Persistent Codex runtime**: each Codex profile reuses one local `codex app-server --listen stdio://`; `/stop` interrupts only the active turn.
+- **Bounded group history**: regular groups are scoped by `chat_id`, topic groups by `thread_id`, with durable incremental cursors.
+- **Codex deep links**: run, result, `/status`, and `/resume` cards can open the matching desktop thread.
 
 ## Prerequisites
 
@@ -103,6 +106,35 @@ For example, to restart only the Codex bot:
 lark-channel-bridge restart --profile codex
 lark-channel-bridge status --profile codex
 ```
+
+### Codex App Server runtime
+
+Codex profiles no longer start `codex exec --json` for every message. The bridge lazily starts one persistent `codex app-server --listen stdio://` per profile, completes the `initialize` / `initialized` handshake, and uses `thread/start`, `thread/resume`, and `turn/start`. `/resume` history uses `thread/list` on that same connection.
+
+- Sequential tasks and concurrent scopes in one profile reuse the same App Server PID.
+- `/new` clears only the scope-to-thread binding; the next message gets a new thread while the PID stays the same.
+- `/stop` calls `turn/interrupt`; it does not kill the server to simulate an interrupt.
+- An unexpected server exit explicitly fails in-flight turns. The next new task may start one replacement process, but an uncertain old turn is never replayed.
+- Bridge stop, unregister, reconnect, and graceful shutdown close the profile's App Server, escalating signals only after a timeout.
+
+The installed Codex must support `codex app-server --listen stdio://`; there is no silent fallback to `codex exec`. `codex.ignoreUserConfig` and `codex.ignoreRules` use a profile-private compatibility CODEX_HOME view that shares authentication and thread storage while omitting the disabled `config.toml` / user rules.
+
+### Group history and Feishu permissions
+
+History is fetched only after chat access control and `requireMentionInGroup` pass. Defaults are the most recent **30 messages**, **24,000 content characters**, and **24 hours**. Regular groups use `container_id_type=chat`; topics use `container_id_type=thread`, preventing cross-topic and cross-chat leakage.
+
+The current batch stays in `<user_input>`, history is isolated in `<group_context>`, and explicit replies stay in `<quoted_messages>`. Message IDs are deduplicated across all three. The bridge filters its own historical cards/replies, retains other bots as `senderType: bot`, and includes only metadata for historical attachments. A cursor isolated by `profile + scope + Codex thread ID` advances only after App Server accepts `turn/start`, and persists across bridge restarts.
+
+Besides the existing send/receive scopes, group backfill requires:
+
+- `im:message:readonly` (read message history)
+- `im:message.group_msg` (sensitive “all group messages” scope, required to backfill ordinary non-mention messages)
+
+After adding scopes, create and publish a new Feishu app version, wait for tenant propagation, and restart the profile. Permission, timeout, or pagination failures degrade safely: the trigger batch and explicit quotes still run. `/status` reports `full`, `truncated`, or `degraded`; logs contain only counts, character totals, and status—not group message bodies.
+
+### Codex desktop deep links
+
+Once App Server returns a valid thread ID, “Open in Codex” appears on Codex streaming, completed, failed, and interrupted cards, the active `/status` card, and every Codex `/resume` entry. The bridge opens the exact `codex://threads/<thread-id>` target locally. Because Feishu Web can suppress custom-scheme `open_url` actions, the button uses an authenticated, thread-bound card callback and a local argv-based desktop opener; it never accepts an arbitrary URL from the click payload. Claude entries, missing sessions, and damaged IDs do not render a button. The target requires a desktop client on a machine that can access the same Codex thread store; mobile clients cannot open that local session.
 
 ## Commands
 
@@ -226,6 +258,7 @@ The legacy `sandbox` field is still readable for old configs. After the bridge s
 | `~/.lark-channel/active-profile` | Last selected profile |
 | `~/.lark-channel/profiles/<profile>/sessions.json` | Session state |
 | `~/.lark-channel/profiles/<profile>/sessions.json.catalog.json` | Agent-aware session catalog |
+| `~/.lark-channel/profiles/<profile>/sessions.json.group-context.json` | Durable low-sensitivity group cursor/status; no message bodies |
 | `~/.lark-channel/profiles/<profile>/workspaces.json` | Current and named workspace bindings |
 | `~/.lark-channel/profiles/<profile>/secrets.enc` | Profile-local encrypted secrets |
 | `~/.lark-channel/profiles/<profile>/lark-cli/` | Profile-local lark-cli directory |
@@ -306,6 +339,12 @@ Cloud-doc comments do not need a separate workspace binding or document allowlis
 ## FAQ
 
 **The bot stays silent or the local CLI never replies.** Usually the local `claude` or `codex` CLI is not logged in, or the current session points to a working directory that no longer exists. Send `/status` to inspect; `/new` often fixes it by starting a fresh session.
+
+**A Codex profile says App Server is unavailable.** Run `codex --version` and `codex app-server --help`, then upgrade to a build with stdio App Server support. The bridge does not fall back to `codex exec`. If an obsolete user `config.toml` blocks startup, enable `codex.ignoreUserConfig` for the profile and restart; auth and thread history remain shared.
+
+**Group context is degraded.** Confirm `im:message:readonly` and `im:message.group_msg` are granted and published in a new app version, and that the bot is still a member of the target group. `/status` distinguishes permission, timeout, and pagination failures.
+
+**“Open in Codex” does nothing.** A desktop app must register the `codex://` protocol, and that machine must have the thread created by the bridge. Mobile devices or another machine without the thread cannot open the corresponding local session.
 
 **The agent subprocess looks frozen (card stuck on the last frame).** The bridge supports an idle watchdog: if the agent emits nothing for N minutes, the process is killed and the card is annotated with the auto-termination reason. Disabled by default. Enable with `/config` globally, or `/timeout 10` for the current session; `/timeout off` disables it for the session; `/timeout default` clears the session override.
 

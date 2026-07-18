@@ -162,6 +162,7 @@ describe('profile logger observability', () => {
     expect(entry.path).toBe('[REDACTED_PATH]');
     expect(entry._chatId).toBe('oc_1234567890');
     expect(entry.sessionId).toBe('sess_1234567890');
+    expect(entry.threadId).toBe('...567890');
     expect(entry.sourceMessageId).toBe('om_source_secret');
     expect(entry.replyId).toBe('reply_secret');
     expect(entry.reactionId).toBe('reaction_secret');

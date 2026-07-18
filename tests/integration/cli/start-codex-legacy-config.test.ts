@@ -107,6 +107,7 @@ describe('Codex startup compatibility with legacy binary metadata', () => {
         cwd: h.workspace,
       }),
     ).resolves.toBeUndefined();
+    await agent.close?.();
   });
 });
 
@@ -131,12 +132,14 @@ async function createLegacyCodexConfig(options: {
   await writeFile(
     codex,
     [
-      '#!/bin/sh',
-      'if [ "$1" = "--version" ]; then',
-      '  echo "codex-cli 999.0.0"',
-      '  exit 0',
-      'fi',
-      'exit 0',
+      '#!/usr/bin/env node',
+      "if (process.argv[2] === '--version') { console.log('codex-cli 999.0.0'); process.exit(0); }",
+      "const { createInterface } = require('node:readline');",
+      "const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });",
+      "rl.on('line', (line) => {",
+      "  const req = JSON.parse(line);",
+      "  if (req.method === 'initialize') process.stdout.write(JSON.stringify({ id: req.id, result: { userAgent: 'fake', codexHome: '', platformFamily: 'unix', platformOs: 'test' } }) + '\\n');",
+      "});",
       '',
     ].join('\n'),
     'utf8',

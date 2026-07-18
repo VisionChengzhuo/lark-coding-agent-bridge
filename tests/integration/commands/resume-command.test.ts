@@ -196,8 +196,11 @@ describe('agent-aware resume commands', () => {
     const rendered = JSON.stringify(card);
     expect(rendered).toContain('alpha prompt');
     expect(rendered).toContain('beta prompt');
-    expect(rendered).not.toContain('thread-alpha-secret');
-    expect(rendered).not.toContain('thread-beta-secret');
+    expect(rendered).toContain('codex://threads/thread-alpha-secret');
+    expect(rendered).toContain('codex://threads/thread-beta-secret');
+    const callbackValues = JSON.stringify(callbackValuesFromCard(card));
+    expect(callbackValues).not.toContain('thread-alpha-secret');
+    expect(callbackValues).not.toContain('thread-beta-secret');
 
     const nonces = resumeArgsFromCard(card);
     expect(nonces).toHaveLength(2);
@@ -475,6 +478,23 @@ function resumeArgsFromCard(card: unknown): string[] {
     const record = value as Record<string, unknown>;
     const action = record.value as Record<string, unknown> | undefined;
     if (action?.cmd === 'resume.use' && typeof action.arg === 'string') out.push(action.arg);
+    for (const child of Object.values(record)) {
+      if (Array.isArray(child)) child.forEach(visit);
+      else visit(child);
+    }
+  };
+  visit(card);
+  return out;
+}
+
+function callbackValuesFromCard(card: unknown): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return;
+    const record = value as Record<string, unknown>;
+    if (record.value && typeof record.value === 'object' && !Array.isArray(record.value)) {
+      out.push(record.value as Record<string, unknown>);
+    }
     for (const child of Object.values(record)) {
       if (Array.isArray(child)) child.forEach(visit);
       else visit(child);

@@ -127,6 +127,36 @@ describe('CallbackAuth', () => {
       reason: 'nonce-revoked',
     });
   });
+
+  it('authenticates detached Codex-open callbacks without an active run', async () => {
+    const h = await harness({ nonce: 'nonce-codex-open' });
+    const token = h.auth.signCodexOpen({
+      scope: 'chat-1',
+      chatId: 'oc_1',
+      operatorOpenId: 'ou_1',
+      threadId: 'thread-1',
+      policyFingerprint: 'fp-1',
+      ttlMs: 60_000,
+    });
+
+    expect(token).toMatch(/^bridge_codex_open\.v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    expect(
+      h.auth.verifyCodexOpen(token, {
+        scope: 'chat-1',
+        chatId: 'oc_1',
+        operatorOpenId: 'ou_1',
+        policyFingerprint: 'fp-1',
+      }),
+    ).toMatchObject({ ok: true, payload: { t: 'thread-1' } });
+    expect(
+      h.auth.verifyCodexOpen(token, {
+        scope: 'chat-1',
+        chatId: 'oc_1',
+        operatorOpenId: 'ou_1',
+        policyFingerprint: 'fp-1',
+      }),
+    ).toMatchObject({ ok: false, reason: 'nonce-replay' });
+  });
 });
 
 function baseSignInput() {

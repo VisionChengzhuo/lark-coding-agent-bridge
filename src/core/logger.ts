@@ -206,6 +206,7 @@ function sanitizeLogValue(
     return '[REDACTED_PATH]';
   }
   if (RESOURCE_ID_KEYS.has(normalizedKey)) return '[REDACTED_RESOURCE]';
+  if (normalizedKey === 'threadId') return redactId(value);
   if (options.redactIds && ID_KEYS.has(normalizedKey)) return redactId(value);
   if (Array.isArray(value)) {
     return value.map((item) => sanitizeLogValue(key, item, options));

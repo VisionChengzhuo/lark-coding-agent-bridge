@@ -11,9 +11,11 @@ import { canUseDm, canUseGroup } from '../policy/access';
 import type { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
+import type { GroupContextCursorStore } from '../session/group-context-cursor';
 import type { WorkspaceStore } from '../workspace/store';
 import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 import { lookupMessageThreadId } from '../bot/thread-id';
+import { openCodexThreadOnDesktop } from './codex-open';
 
 /** Marker key on a button's value object that flags the cardAction as
  * a callback that should be forwarded back to the agent instead
@@ -29,6 +31,7 @@ export interface CardDispatchDeps {
   evt: CardActionEvent;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  groupContextCursors?: GroupContextCursorStore;
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   agent: AgentAdapter;
@@ -40,6 +43,7 @@ export interface CardDispatchDeps {
   callbackAuth?: CallbackAuth;
   callbackPolicyFingerprint?: string;
   callbackPolicyFingerprintForScope?: (scope: string) => string | undefined;
+  openCodexThread?: (threadId: string) => Promise<void>;
 }
 
 export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
@@ -84,12 +88,55 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
 
   const cmd = typeof payload.cmd === 'string' ? payload.cmd : '';
   if (cmd) {
+    const msg = makeFakeMsg(deps.evt, threadId, mode);
+    const catalogIdentity = await commandSessionCatalogIdentity({
+      msg,
+      scope,
+      mode,
+      workspaces: deps.workspaces,
+      controls: deps.controls,
+      access: accessDecision,
+    });
+    if (cmd === 'codex.open') {
+      if (deps.agent.id !== 'codex') {
+        log.warn('cardAction', 'codex-open-wrong-agent', { scope, agent: deps.agent.id });
+        return;
+      }
+      const token = typeof payload.bridge_token === 'string' ? payload.bridge_token : '';
+      const result = deps.callbackAuth?.verifyCodexOpen(token, {
+        scope,
+        chatId,
+        operatorOpenId: operatorId,
+        policyFingerprint:
+          deps.callbackPolicyFingerprintForScope?.(scope) ??
+          catalogIdentity?.policyFingerprint ??
+          deps.callbackPolicyFingerprint ??
+          '',
+      });
+      if (!result?.ok) {
+        log.warn('callback', 'denied', {
+          scope,
+          action: cmd,
+          reason: result?.reason ?? 'missing-token-or-auth',
+        });
+        return;
+      }
+      const requestedThreadId = result.payload.t;
+      try {
+        await (deps.openCodexThread ?? openCodexThreadOnDesktop)(requestedThreadId);
+        log.info('cardAction', 'codex-opened', {
+          scope,
+          threadSuffix: requestedThreadId.slice(-8),
+        });
+      } catch (error) {
+        log.fail('cardAction', error, { cmd, scope });
+      }
+      return;
+    }
     if (isSignedBridgeCallback(payload) && !verifyBridgeToken(deps, payload, scope, cmd)) {
       return;
     }
     log.info('cardAction', 'cmd', { cmd, scope });
-    const msg = makeFakeMsg(deps.evt, threadId);
-
     const ctx: CommandContext = {
       channel: deps.channel,
       msg,
@@ -97,14 +144,8 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
       chatMode: mode,
       sessions: deps.sessions,
       sessionCatalog: deps.sessionCatalog,
-      sessionCatalogIdentity: await commandSessionCatalogIdentity({
-        msg,
-        scope,
-        mode,
-        workspaces: deps.workspaces,
-        controls: deps.controls,
-        access: accessDecision,
-      }),
+      groupContextCursors: deps.groupContextCursors,
+      sessionCatalogIdentity: catalogIdentity,
       workspaces: deps.workspaces,
       activeRuns: deps.activeRuns,
       agent: deps.agent,
@@ -113,6 +154,17 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
       controls: deps.controls,
       formValue,
       fromCardAction: true,
+      signCodexOpen: deps.callbackAuth
+        ? (codexThreadId: string) =>
+            deps.callbackAuth!.signCodexOpen({
+              scope,
+              chatId,
+              operatorOpenId: operatorId,
+              threadId: codexThreadId,
+              policyFingerprint: catalogIdentity?.policyFingerprint ?? '',
+              ttlMs: 24 * 60 * 60 * 1000,
+            })
+        : undefined,
     };
 
     const [name, ...rest] = cmd.split('.');
@@ -252,11 +304,12 @@ function composeArgs(sub: string, payload: Record<string, unknown>): string {
 function makeFakeMsg(
   evt: CardActionEvent,
   threadId: string | undefined,
+  mode: 'p2p' | 'group' | 'topic',
 ): NormalizedMessage {
   return {
     messageId: evt.messageId,
     chatId: evt.chatId,
-    chatType: 'p2p',
+    chatType: mode === 'p2p' ? 'p2p' : 'group',
     threadId,
     senderId: evt.operator.openId,
     senderName: evt.operator.name,

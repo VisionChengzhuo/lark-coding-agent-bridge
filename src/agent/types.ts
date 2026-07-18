@@ -4,7 +4,14 @@ import type { ClaudePermissionMode, CodexSandboxMode } from '../config/permissio
 export type { ClaudePermissionMode } from '../config/permissions';
 
 export type AgentEvent =
-  | { type: 'system'; sessionId?: string; threadId?: string; cwd?: string; model?: string }
+  | {
+      type: 'system';
+      sessionId?: string;
+      threadId?: string;
+      turnId?: string;
+      cwd?: string;
+      model?: string;
+    }
   | { type: 'text'; delta: string }
   | { type: 'final_text'; content: string }
   | { type: 'thinking'; delta: string }
@@ -46,6 +53,9 @@ export interface AgentRunOptions {
    * are adapter-specific.
   */
   stopGraceMs?: number;
+  /** Called only after the runtime has accepted the turn. Used for durable
+   * cursors whose state must not advance when submission fails. */
+  onTurnAccepted?: (input: { threadId: string; turnId: string }) => void | Promise<void>;
 }
 
 export interface AgentRun {
@@ -76,6 +86,17 @@ export interface AgentBotIdentity {
   name?: string;
 }
 
+export interface AgentThreadHistoryEntry {
+  threadId: string;
+  sessionId?: string;
+  preview: string;
+  cwd: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+  source: string;
+  name?: string;
+}
+
 export interface AgentAdapter {
   readonly id: string;
   readonly displayName: string;
@@ -83,6 +104,12 @@ export interface AgentAdapter {
   checkAvailability?(): Promise<AgentAvailability>;
   prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;
+  listThreadHistory?(input: {
+    cwd: string;
+    limit: number;
+    timeoutMs?: number;
+  }): Promise<AgentThreadHistoryEntry[]>;
+  close?(): Promise<void>;
   /**
    * Late-bound identity injection: the adapter is constructed before the
    * channel connects, so the channel calls this once botIdentity is known.

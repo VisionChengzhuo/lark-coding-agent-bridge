@@ -31,6 +31,16 @@ export interface BridgePromptQuotedMessage {
   content: string;
 }
 
+export interface BridgePromptGroupContext {
+  chatId: string;
+  chatMode: 'group' | 'topic';
+  threadId?: string;
+  status: 'full' | 'truncated' | 'degraded';
+  truncated: boolean;
+  degradedReason?: string;
+  messages: unknown[];
+}
+
 export interface BridgePromptInteractiveCard {
   messageId?: string;
   content: unknown;
@@ -77,6 +87,7 @@ export interface BuildAgentPromptInput {
   instructions?: string[];
   userInput: string;
   topicContext?: BridgePromptTopicMessage[];
+  groupContext?: BridgePromptGroupContext;
   quotedMessages?: BridgePromptQuotedMessage[];
   interactiveCards?: BridgePromptInteractiveCard[];
   comment?: BridgePromptComment;
@@ -92,6 +103,7 @@ export function buildAgentPrompt(input: BuildAgentPromptInput): string {
     input.topicContext && input.topicContext.length > 0
       ? promptSection('topic_context', input.topicContext)
       : undefined,
+    input.groupContext ? promptSection('group_context', input.groupContext) : undefined,
     input.quotedMessages && input.quotedMessages.length > 0
       ? promptSection('quoted_messages', input.quotedMessages)
       : undefined,
