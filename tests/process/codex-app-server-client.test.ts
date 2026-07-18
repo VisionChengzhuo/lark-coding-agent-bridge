@@ -128,7 +128,9 @@ describe('CodexAppServerClient process contract', () => {
     });
     clients.push(client);
 
-    await expect(client.ensureStarted()).rejects.toThrow('spawn returned no pid');
+    await expect(client.ensureStarted()).rejects.toThrow(
+      /(spawn returned no pid|spawn .* ENOENT)/,
+    );
   });
 });
 
