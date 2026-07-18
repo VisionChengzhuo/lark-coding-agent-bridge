@@ -16,6 +16,9 @@
 - **多工作空间**：用 `/cd` 切换当前项目，用 `/ws` 保存和复用常用项目目录。
 - **图片 / 文件**：直接发给 bot，bridge 下载到本地后交给本机 agent 处理。
 - **卡片按钮**：`/help`、`/ws list`、`/status` 返回可点击的交互卡片。
+- **Codex 常驻运行时**：每个 Codex profile 复用一个本地 `codex app-server --listen stdio://`，`/stop` 只中断当前 turn。
+- **群聊历史上下文**：普通群按 `chat_id`、话题群按 `thread_id` 有界回填，续聊只注入上次成功提交后的增量。
+- **Codex 深链接**：Codex 运行卡、结果卡、`/status` 和 `/resume` 可直接打开对应桌面会话。
 
 ## 前置条件
 
@@ -103,6 +106,35 @@ lark-channel-bridge start --profile codex --agent codex
 lark-channel-bridge restart --profile codex
 lark-channel-bridge status --profile codex
 ```
+
+### Codex App Server 运行方式
+
+Codex profile 不再为每条飞书消息启动 `codex exec --json`。bridge 会为该 profile 懒启动一个常驻的 `codex app-server --listen stdio://`，完成 `initialize` / `initialized` 握手后，用 `thread/start`、`thread/resume` 和 `turn/start` 处理请求。历史列表也通过这个共享连接调用 `thread/list`。
+
+- 同一 profile 的顺序任务和不同 scope 的并发任务复用同一个 App Server PID。
+- `/new` 只解除当前 scope 的 thread 绑定；下一条消息创建新 thread，App Server PID 不变。
+- `/resume` 绑定真实 Codex thread；`/stop` 调用 `turn/interrupt`，不会用杀掉 App Server 冒充中断。
+- App Server 意外退出时，当前 turn 明确失败；下一条新任务最多启动一个新进程，不自动重放状态不明的旧 turn。
+- bridge `stop`、`unregister`、重连或正常退出时会关闭对应 App Server，超时才升级终止信号。
+
+最低要求是本机 Codex 支持 `codex app-server --listen stdio://`。bridge 不会静默回退到旧的 `codex exec`。`codex.ignoreUserConfig` / `codex.ignoreRules` 会通过 profile 私有的兼容 CODEX_HOME 视图实现：保留登录与 thread 存储，但不加载被禁用的 `config.toml` / 用户 rules。
+
+### 群聊历史上下文与飞书权限
+
+群上下文只在聊天访问控制和 `requireMentionInGroup` 检查通过后读取。默认边界固定为：最近 **30 条**、正文合计 **24,000 字符**、不早于 **24 小时**。普通群调用消息历史 API 时使用 `container_id_type=chat`；话题使用 `container_id_type=thread`，不会把其他话题或群的消息混进来。
+
+当前触发批次仍位于 `<user_input>`；历史位于独立的 `<group_context>`；显式引用位于 `<quoted_messages>`。三者按 message ID 去重。bridge 会过滤当前机器人自己的历史卡片/回答，保留其他 bot 并标为 `senderType: bot`；历史附件只注入类型、文件名和消息 ID 等元数据，不批量下载。只有 App Server 接受 `turn/start` 后才推进按 `profile + scope + Codex thread ID` 隔离的游标；bridge 重启后仍从持久化游标增量读取。
+
+飞书应用需要现有的收发消息权限，并为群历史额外开通：
+
+- `im:message:readonly`（获取单聊、群组消息 / 调用历史消息 API）
+- `im:message.group_msg`（获取群组中所有消息，敏感权限；否则无法回填未 @bot 的普通群消息）
+
+新增权限后必须在飞书开发者后台创建并发布一个应用版本，等待租户生效，再重启 profile。权限缺失、API 超时或分页失败时，当前触发消息和显式引用仍会继续执行；`/status` 会显示 `group context: degraded` 及低敏原因。正常状态为 `full`，触达条数/字符边界时为 `truncated`。日志只记录数量、字符数和状态，不记录群聊正文。
+
+### Codex 桌面深链接
+
+拿到 App Server 返回的真实 thread ID 后，以下卡片会显示“在 Codex 中打开”：Codex 流式运行卡、完成/失败/中断卡、`/status` 当前会话、`/resume` 的每个 Codex 历史条目。bridge 在本机打开精确的 `codex://threads/<thread-id>`；由于飞书 Web 会拦截自定义协议的直接 `open_url`，按钮使用绑定 thread ID 的受认证卡片回调和参数数组形式的本机 opener，点击载荷不接受任意 URL。Claude、无 session 或损坏 ID 不显示按钮。目标只适用于装有 Codex/ChatGPT 桌面端且能访问同一 CODEX_HOME thread 存储的电脑；移动端不会打开本机 Codex 会话。
 
 ## 命令速查
 
@@ -226,6 +258,7 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 | `~/.lark-channel/active-profile` | 最近选择的 profile |
 | `~/.lark-channel/profiles/<profile>/sessions.json` | 会话状态 |
 | `~/.lark-channel/profiles/<profile>/sessions.json.catalog.json` | agent-aware 会话索引 |
+| `~/.lark-channel/profiles/<profile>/sessions.json.group-context.json` | 群上下文增量游标和低敏状态，不含群聊正文 |
 | `~/.lark-channel/profiles/<profile>/workspaces.json` | 当前和命名工作空间绑定 |
 | `~/.lark-channel/profiles/<profile>/secrets.enc` | profile 本地加密 secret |
 | `~/.lark-channel/profiles/<profile>/lark-cli/` | 当前 profile 的 lark-cli 目录 |
@@ -306,6 +339,12 @@ grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y
 ## 常见问题
 
 **bot 没反应 / agent 不回复**：通常是本机 `claude` 或 `codex` CLI 没登录，或者当前会话指向了不存在的工作目录。发 `/status` 看当前状态；`/new` 重开会话往往就好。
+
+**Codex profile 报 App Server 不可用**：运行 `codex --version` 和 `codex app-server --help`，升级到支持 stdio App Server 的 Codex。bridge 不会回退到 `codex exec`。如果用户 `config.toml` 有过期字段，启用 profile 的 `codex.ignoreUserConfig` 后重启；登录和历史 thread 仍会共享。
+
+**群上下文显示 degraded**：先确认应用有 `im:message:readonly` 和 `im:message.group_msg`，且新增权限已随新应用版本发布；再确认 bot 仍在目标群中。`/status` 会区分权限、超时和分页类原因。
+
+**点击“在 Codex 中打开”没有反应**：该按钮需要 macOS/Windows 桌面端注册 `codex://` 协议，并且当前电脑能读取创建该 thread 的 Codex 存储。移动端或另一台没有该 thread 的电脑无法打开对应本地会话。
 
 **agent 子进程假死（卡片停在最后一帧不动）**：支持 idle 探活。agent 一段时间没输出就会被 SIGTERM kill，卡片末尾会标出自动终止原因。默认关闭。开启方式：`/config` 设全局值（分钟），或 `/timeout 10` 只对当前会话生效；`/timeout off` 关掉当前会话的探活；`/timeout default` 清掉会话覆盖，回退到全局设置。
 

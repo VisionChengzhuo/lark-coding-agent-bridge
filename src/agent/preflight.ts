@@ -11,7 +11,8 @@ export type AgentPreflightErrorCode =
   | 'agent-version-check-timeout'
   | 'agent-version-check-signaled'
   | 'agent-version-check-nonzero-exit'
-  | 'agent-version-check-empty-output';
+  | 'agent-version-check-empty-output'
+  | 'codex-app-server-unavailable';
 
 export interface AgentPreflightDiagnostic {
   code: AgentPreflightErrorCode;
@@ -30,6 +31,8 @@ export interface AgentPreflightDiagnostic {
   field?: string;
   expected?: string | number;
   actual?: string | number;
+  details?: string;
+  recovery?: string;
 }
 
 export type AgentAvailability =
@@ -196,6 +199,14 @@ export function formatAgentPreflightError(err: AgentPreflightError): string {
 export function formatAgentPreflightDiagnostic(diagnostic: AgentPreflightDiagnostic): string {
   const command = commandForDisplay(diagnostic);
   switch (diagnostic.code) {
+    case 'codex-app-server-unavailable':
+      return [
+        '✗ Codex App Server 无法启动或初始化。',
+        '',
+        diagnostic.details ?? '当前 Codex 缺少 bridge 所需的 App Server 协议。',
+        diagnostic.recovery ?? '请升级 Codex CLI，并确认 `codex app-server --listen stdio://` 可用。',
+        `错误码：${diagnostic.code}`,
+      ].join('\n');
     case 'agent-binary-not-found':
       return [
         `✗ 未找到本地 ${diagnostic.agentName}。`,

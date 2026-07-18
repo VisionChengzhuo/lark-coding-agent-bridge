@@ -35,6 +35,13 @@ export interface StartRunFlowInput {
   executor: RunExecutor;
   now: number;
   stopGraceMs?: number;
+  preparePrompt?: (input: {
+    policy: RunPolicyAllow;
+    threadId?: string;
+  }) => Promise<{
+    prompt: string;
+    onTurnAccepted?: (input: { threadId: string; turnId: string }) => void | Promise<void>;
+  }>;
   observability?: {
     profile: string;
     agent: string;
@@ -137,11 +144,21 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     }
   }
 
+  let runPolicy = policy;
+  let onTurnAccepted:
+    | ((input: { threadId: string; turnId: string }) => void | Promise<void>)
+    | undefined;
+  if (input.preparePrompt) {
+    const prepared = await input.preparePrompt({ policy, threadId });
+    runPolicy = { ...policy, prompt: prepared.prompt };
+    onTurnAccepted = prepared.onTurnAccepted;
+  }
+
   let execution: RunExecution;
   try {
     execution = await input.executor.submit({
       scopeId: input.scopeId,
-      policy,
+      policy: runPolicy,
       sessionId,
       threadId,
       model: resolveModelArg(
@@ -156,6 +173,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
               .filter((path): path is string => Boolean(path))
           : undefined,
       stopGraceMs: input.stopGraceMs,
+      onTurnAccepted,
       observability: input.observability,
     });
   } catch (err) {
@@ -180,7 +198,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   return {
     ok: true,
     execution,
-    policy,
+    policy: runPolicy,
     cwdRealpath: workspace.cwdRealpath,
     ...(resumeFrom ? { resumeFrom } : {}),
   };

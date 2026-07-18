@@ -70,13 +70,13 @@ import {
 } from '../card/run-state';
 import { formatRelTime, listRecentSessions, type SessionSummary } from '../session/history';
 import {
-  listCodexThreadHistory,
   type CodexThreadHistoryEntry,
   type ListCodexThreadHistoryOptions,
 } from '../session/codex-history';
 import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog';
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
 import type { SessionStore } from '../session/store';
+import type { GroupContextCursorStore } from '../session/group-context-cursor';
 import { resolveWorkingDirectory } from '../policy/workspace';
 import { evaluateRunPolicy } from '../policy/run-policy';
 import type { ProcessPool } from '../bot/process-pool';
@@ -129,6 +129,7 @@ export interface CommandContext {
   chatMode: 'p2p' | 'group' | 'topic';
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  groupContextCursors?: GroupContextCursorStore;
   sessionCatalogIdentity?: SessionCatalogIdentity;
   workspaces: WorkspaceStore;
   agent: AgentAdapter;
@@ -146,6 +147,8 @@ export interface CommandContext {
    * text command. Determines whether to update the existing card vs send a
    * new one. */
   fromCardAction?: boolean;
+  /** Produce an authenticated, opaque callback token for a Codex thread. */
+  signCodexOpen?: (threadId: string) => string;
 }
 
 type Handler = (args: string, ctx: CommandContext) => Promise<void>;
@@ -564,13 +567,14 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
         const nonce = issueResumeCandidate(identity, { threadId: thread.threadId });
         return {
           sessionId: nonce,
+          codexThreadId: thread.threadId,
           preview: thread.name || thread.preview,
           relTime: formatRelTime(thread.updatedAtMs),
           detail: `Codex · ${thread.source}`,
           current: thread.threadId === entry?.threadId,
         };
       });
-      const card = resumeCard(cwd, entries);
+      const card = resumeCard(cwd, entries, { signCodexOpen: ctx.signCodexOpen });
       await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
       return;
     }
@@ -582,7 +586,7 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
       );
       return;
     }
-    const card = resumeCard(cwd, []);
+    const card = resumeCard(cwd, [], { signCodexOpen: ctx.signCodexOpen });
     await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
     return;
   }
@@ -600,7 +604,7 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
     lineCount: s.lineCount,
     current: s.sessionId === currentSession?.sessionId,
   }));
-  const card = resumeCard(cwd, entries);
+  const card = resumeCard(cwd, entries, { signCodexOpen: ctx.signCodexOpen });
   await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 
@@ -722,21 +726,12 @@ async function listCodexResumeHistory(
   cwd: string,
   limit: number,
 ): Promise<CodexThreadHistoryEntry[]> {
-  const codex = ctx.controls.profileConfig.codex;
-  const binary = codex?.binaryPath;
-  if (!binary) return [];
-
-  const provider = ctx.codexHistoryProvider ?? listCodexThreadHistory;
+  const provider = ctx.codexHistoryProvider ?? ctx.agent.listThreadHistory?.bind(ctx.agent);
+  if (!provider) return [];
   try {
     return await provider({
-      binary,
       cwd,
       limit,
-      profileStateDir: commandProfilePaths(ctx).profileDir,
-      ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
-      ...(codex.inheritCodexHome !== undefined
-        ? { inheritCodexHome: codex.inheritCodexHome }
-        : {}),
     });
   } catch (err) {
     log.warn('session', 'codex-history-failed', {
@@ -816,6 +811,7 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     profileName: ctx.controls.profile,
     cwd,
     sessionId: isCodex ? catalogEntry?.threadId : sess?.sessionId,
+    codexThreadId: isCodex ? catalogEntry?.threadId : undefined,
     emptySessionText: isCodex ? '(未建立)' : undefined,
     sessionStale: !isCodex && Boolean(cwd && sess && sess.cwd !== cwd),
     agentName: ctx.agent.displayName,
@@ -828,7 +824,11 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     ownerState: formatOwnerState(ctx),
     scope: ctx.scope,
     chatMode: ctx.chatMode,
-  });
+    groupContext:
+      ctx.chatMode === 'p2p'
+        ? undefined
+        : ctx.groupContextCursors?.diagnosticFor(ctx.controls.profile, ctx.scope),
+  }, { signCodexOpen: ctx.signCodexOpen });
   await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 

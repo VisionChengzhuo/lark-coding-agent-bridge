@@ -1,5 +1,6 @@
 import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
+import { tryCodexThreadDeepLink } from './codex-link';
 
 const REASONING_MAX = 1500;
 const COLLAPSE_TOOL_THRESHOLD = 3;
@@ -16,6 +17,7 @@ type Group = ToolGroup | TextGroup;
 
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
+  signCodexOpen?: (threadId: string) => string;
 }
 
 export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
@@ -48,7 +50,12 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
 
   if (state.terminal === 'running') {
     if (state.footer) elements.push(footerStatus(state.footer));
+    const deepLink = tryCodexThreadDeepLink(state.threadId);
+    if (deepLink && state.threadId) elements.push(codexOpenButton(state.threadId, options));
     elements.push(stopButton(options));
+  } else {
+    const deepLink = tryCodexThreadDeepLink(state.threadId);
+    if (deepLink && state.threadId) elements.push(codexOpenButton(state.threadId, options));
   }
 
   return {
@@ -58,6 +65,18 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
       summary: { content: summaryText(state) },
     },
     body: { elements },
+  };
+}
+
+function codexOpenButton(threadId: string, options: RunCardRenderOptions): object {
+  const token = options.signCodexOpen?.(threadId);
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: '在 Codex 中打开' },
+    type: 'default',
+    behaviors: token
+      ? [{ type: 'callback', value: { cmd: 'codex.open', bridge_token: token } }]
+      : [{ type: 'open_url', default_url: tryCodexThreadDeepLink(threadId) }],
   };
 }
 

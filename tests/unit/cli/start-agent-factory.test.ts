@@ -35,7 +35,7 @@ describe('start runtime agent factory', () => {
     });
 
     expect(agent.id).toBe('codex');
-    expect(agent.displayName).toBe('Codex CLI');
+    expect(agent.displayName).toBe('Codex App Server');
     expect(profile.permissions).toEqual({
       defaultAccess: 'workspace',
       maxAccess: 'workspace',
@@ -57,7 +57,7 @@ describe('start runtime agent factory', () => {
     );
 
     expect(agent.id).toBe('codex');
-    expect(agent.displayName).toBe('Codex CLI');
+    expect(agent.displayName).toBe('Codex App Server');
   });
 
   it('seeds a default Codex binary when bootstrapping a new Codex profile', () => {

@@ -9,6 +9,7 @@ import { claudeCapability, codexCapability } from '../agent/capability';
 import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
 import {
   buildAgentPrompt,
+  type BridgePromptGroupContext,
   type BridgePromptInteractiveCard,
   type BridgePromptMention,
   type BridgePromptQuotedMessage,
@@ -52,6 +53,7 @@ import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
+import type { GroupContextCursorStore } from '../session/group-context-cursor';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
@@ -65,6 +67,7 @@ import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quo
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
+import { fetchGroupContext, type GroupContextResult } from './group-context';
 import type { AppPaths } from '../config/app-paths';
 import {
   consumeCotEvents,
@@ -174,13 +177,14 @@ export interface StartChannelDeps {
   agent: AgentAdapter;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  groupContextCursors?: GroupContextCursorStore;
   workspaces: WorkspaceStore;
   controls: Controls;
   appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'>;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
-  const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
+  const { cfg, agent, sessions, sessionCatalog, groupContextCursors, workspaces, controls } = deps;
   const activeRuns = new ActiveRuns();
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
@@ -307,6 +311,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           executor,
           sessions,
           sessionCatalog,
+          groupContextCursors,
           workspaces,
           media,
           batch,
@@ -338,6 +343,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           agent,
           sessions,
           sessionCatalog,
+          groupContextCursors,
           workspaces,
           activeRuns,
           pending,
@@ -347,6 +353,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           logThreadModeOverride,
           executor,
           pool,
+          callbackAuth,
         }),
       ).catch((err) => log.fail('intake', err));
     },
@@ -360,6 +367,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           evt,
           sessions,
           sessionCatalog,
+          groupContextCursors,
           workspaces,
           activeRuns,
           agent,
@@ -472,17 +480,23 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       knownChatsRefresh.stop();
       keepalive.stop();
       pending.cancelAll();
-      const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
-        channel.disconnect(),
-        activeRuns.stopAll(),
-        sessions.flush(),
-        sessionCatalog?.flush(),
-        callbackNonceStore?.flush(),
-        workspaces.flush(),
-      ]);
+      const disconnectPromise = channel.disconnect();
+      const [stopAllResult] = await Promise.allSettled([activeRuns.stopAll()]);
       if (stopAllResult.status === 'rejected') {
         log.fail('disconnect', stopAllResult.reason, { step: 'stopAll' });
       }
+      const [agentCloseResult] = await Promise.allSettled([agent.close?.()]);
+      if (agentCloseResult.status === 'rejected') {
+        log.fail('disconnect', agentCloseResult.reason, { step: 'agentClose' });
+      }
+      const [disconnectResult, ...flushResults] = await Promise.allSettled([
+        disconnectPromise,
+        sessions.flush(),
+        sessionCatalog?.flush(),
+        groupContextCursors?.flush(),
+        callbackNonceStore?.flush(),
+        workspaces.flush(),
+      ]);
       for (const [idx, result] of flushResults.entries()) {
         if (result.status === 'rejected') {
           log.fail('disconnect', result.reason, { step: `flush-${idx}` });
@@ -535,6 +549,7 @@ interface IntakeDeps {
   agent: AgentAdapter;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  groupContextCursors?: GroupContextCursorStore;
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   pending: PendingQueue;
@@ -544,6 +559,7 @@ interface IntakeDeps {
   logThreadModeOverride: LogThreadModeOverride;
   executor: RunExecutor;
   pool: ProcessPool;
+  callbackAuth?: CallbackAuth;
 }
 
 type LogThreadModeOverride = (input: {
@@ -558,6 +574,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     agent,
     sessions,
     sessionCatalog,
+    groupContextCursors,
     workspaces,
     activeRuns,
     pending,
@@ -567,6 +584,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     logThreadModeOverride,
     executor,
     pool,
+    callbackAuth,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -617,7 +635,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     threadId,
     msgId: msg.messageId,
     sender: msg.senderId,
-    preview,
+    ...(msg.chatType === 'p2p' ? { preview } : { contentChars: msg.content.length }),
     resources: msg.resources.length,
   });
 
@@ -654,6 +672,26 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  const catalogIdentity = await commandSessionCatalogIdentity({
+    msg,
+    scope,
+    mode: chatMode,
+    workspaces,
+    controls,
+    access: accessDecision,
+  });
+  const signCodexOpen = callbackAuth
+    ? (threadId: string) =>
+        callbackAuth.signCodexOpen({
+          scope,
+          chatId: msg.chatId,
+          operatorOpenId: msg.senderId,
+          threadId,
+          policyFingerprint: catalogIdentity?.policyFingerprint ?? '',
+          ttlMs: 24 * 60 * 60 * 1000,
+        })
+    : undefined;
+
   const handled = await tryHandleCommand({
     channel,
     msg: emsg,
@@ -664,17 +702,12 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     agent,
     activeRuns,
     sessionCatalog,
-    sessionCatalogIdentity: await commandSessionCatalogIdentity({
-      msg: emsg,
-      scope,
-      mode: chatMode,
-      workspaces,
-      controls,
-      access: accessDecision,
-    }),
+    groupContextCursors,
+    sessionCatalogIdentity: catalogIdentity,
     runExecutor: executor,
     processPool: pool,
     controls,
+    signCodexOpen,
   });
   if (handled) {
     const dropped = pending.cancel(scope);
@@ -691,6 +724,7 @@ interface RunBatchDeps {
   executor: RunExecutor;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  groupContextCursors?: GroupContextCursorStore;
   workspaces: WorkspaceStore;
   media: MediaCache;
   batch: NormalizedMessage[];
@@ -709,6 +743,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     executor,
     sessions,
     sessionCatalog,
+    groupContextCursors,
     workspaces,
     media,
     batch,
@@ -872,6 +907,63 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     executor,
     now: Date.now(),
     stopGraceMs: getAgentStopGraceMs(controls.cfg),
+    ...(controls.profileConfig.agentKind === 'codex' && firstMsg.chatType !== 'p2p' && groupContextCursors
+      ? {
+          preparePrompt: async ({ threadId: codexThreadId }) => {
+            const triggerCreatedAtMs = messageCreatedAtMs(firstMsg);
+            const excludedMessageIds = new Set([
+              ...batch.map((message) => message.messageId),
+              ...quotes.map((quote) => quote.messageId),
+            ]);
+            const context = await fetchGroupContext({
+              channel,
+              chatId,
+              chatMode: mode === 'topic' ? 'topic' : 'group',
+              ...(mode === 'topic' && threadId ? { threadId } : {}),
+              triggerCreatedAtMs,
+              triggerMessageIds: batch.map((message) => message.messageId),
+              excludedMessageIds,
+              botOpenId: channel.botIdentity?.openId,
+              cursor: groupContextCursors.cursorFor(controls.profile, scope, codexThreadId),
+            });
+            const diagnostic = {
+              status: context.status,
+              messageCount: context.messageCount,
+              charCount: context.charCount,
+              ...(context.degradedReason ? { reason: context.degradedReason } : {}),
+              updatedAt: Date.now(),
+            };
+            groupContextCursors.recordDiagnostic(controls.profile, scope, diagnostic);
+            log.info('context', context.status, {
+              mode: context.chatMode,
+              messageCount: context.messageCount,
+              charCount: context.charCount,
+              truncated: context.truncated,
+              reason: context.degradedReason,
+            });
+            return {
+              prompt: buildPrompt(
+                batch,
+                attachments,
+                quotes,
+                topicContext,
+                channel.botIdentity,
+                extraInstructions,
+                toPromptGroupContext(context),
+              ),
+              onTurnAccepted: ({ threadId: acceptedThreadId }: { threadId: string; turnId: string }) => {
+                groupContextCursors.commit({
+                  profile: controls.profile,
+                  scope,
+                  threadId: acceptedThreadId,
+                  cursor: context.cursorCandidate,
+                  diagnostic,
+                });
+              },
+            };
+          },
+        }
+      : {}),
     observability: {
       profile: controls.profile,
       agent: capability.agentId,
@@ -959,6 +1051,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             chatId,
             operatorOpenId: firstMsg.senderId,
             action,
+            policyFingerprint: flow.policy.policyFingerprint,
+            ttlMs: 24 * 60 * 60 * 1000,
+          }),
+        signCodexOpen: (threadId: string) =>
+          callbackAuth.signCodexOpen({
+            scope,
+            chatId,
+            operatorOpenId: firstMsg.senderId,
+            threadId,
             policyFingerprint: flow.policy.policyFingerprint,
             ttlMs: 24 * 60 * 60 * 1000,
           }),
@@ -1383,6 +1484,8 @@ async function processAgentStream(
 
       if (evt.type === 'system') {
         recordSession(evt);
+        state = reduce(state, evt);
+        await flush(state);
         continue;
       }
       if (evt.type === 'usage') {
@@ -1553,6 +1656,7 @@ function buildPrompt(
   topicContext: QuotedContext[] = [],
   botIdentity?: { openId: string; name?: string },
   extraInstructions?: string[],
+  groupContext?: BridgePromptGroupContext,
 ): string {
   const first = batch[0];
   if (!first) return '';
@@ -1596,12 +1700,37 @@ function buildPrompt(
       extraInstructions && extraInstructions.length > 0
         ? [...BRIDGE_AGENT_INSTRUCTIONS, ...extraInstructions]
         : BRIDGE_AGENT_INSTRUCTIONS,
+    groupContext,
     userInput: userPart,
     ...(topicContext.length > 0 ? { topicContext: topicContext.map(toPromptTopicMessage) } : {}),
     quotedMessages: quotes.map(toPromptQuote),
     interactiveCards: batch.map(toPromptInteractiveCard).filter(isDefined),
     attachments: attachments.map(toPromptAttachment),
   });
+}
+
+function toPromptGroupContext(context: GroupContextResult): BridgePromptGroupContext {
+  return {
+    chatId: context.chatId,
+    chatMode: context.chatMode,
+    ...(context.threadId ? { threadId: context.threadId } : {}),
+    status: context.status,
+    truncated: context.truncated,
+    ...(context.degradedReason ? { degradedReason: context.degradedReason } : {}),
+    messages: context.messages.map(({ createdAtMs: _, ...message }) => message),
+  };
+}
+
+function messageCreatedAtMs(message: NormalizedMessage): number {
+  const normalized = (message as NormalizedMessage & { createTime?: unknown }).createTime;
+  if (typeof normalized === 'number' && Number.isFinite(normalized)) return normalized;
+  const raw = message.raw as { message?: { create_time?: unknown } } | undefined;
+  const value = Number(raw?.message?.create_time);
+  return Number.isFinite(value) && value > 0
+    ? value < 10_000_000_000
+      ? value * 1_000
+      : value
+    : Date.now();
 }
 
 /**

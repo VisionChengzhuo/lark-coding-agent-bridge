@@ -23,6 +23,7 @@ export interface SubmitRunInput {
   model?: string;
   images?: readonly string[];
   stopGraceMs?: number;
+  onTurnAccepted?: (input: { threadId: string; turnId: string }) => void | Promise<void>;
   nowait?: boolean;
   observability?: {
     profile: string;
@@ -104,6 +105,7 @@ export class RunExecutor {
       sandbox: input.policy.sandbox,
       permissionMode: input.policy.permissionMode,
       stopGraceMs: input.stopGraceMs,
+      onTurnAccepted: input.onTurnAccepted,
     };
     let run: AgentRun;
     try {

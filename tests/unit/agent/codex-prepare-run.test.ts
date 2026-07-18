@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../../../src/agent/codex/adapter.js';
+import type { CodexAppServerTransport } from '../../../src/agent/codex/app-server-client.js';
 import { writeVersionExecutable } from '../../helpers/fake-executable.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -17,6 +18,7 @@ describe('CodexAdapter prepareRun', () => {
     const adapter = new CodexAdapter({
       binary,
       profileStateDir: join(tmpdir(), 'codex-profile'),
+      client: readyClient(),
     });
 
     await expect(adapter.prepareRun()).resolves.toBeUndefined();
@@ -26,6 +28,7 @@ describe('CodexAdapter prepareRun', () => {
     const adapter = new CodexAdapter({
       binary: join(tmpdir(), 'missing-codex'),
       profileStateDir: join(tmpdir(), 'codex-profile'),
+      client: readyClient(),
     });
 
     await expect(adapter.prepareRun()).rejects.toMatchObject({
@@ -33,11 +36,23 @@ describe('CodexAdapter prepareRun', () => {
       diagnostic: {
         code: 'agent-binary-not-found',
         agentId: 'codex',
-        agentName: 'Codex CLI',
+        agentName: 'Codex App Server',
       },
     });
   });
 });
+
+function readyClient(): CodexAppServerTransport {
+  return {
+    ensureStarted: async () => {},
+    request: async <T>() => ({} as T),
+    notify: async () => {},
+    onNotification: () => () => {},
+    onExit: () => () => {},
+    pid: () => 1,
+    close: async () => {},
+  };
+}
 
 async function writeCodexBinary(version: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-prepare-run-test-'));

@@ -33,6 +33,37 @@ export interface CallbackVerifyExpected {
   policyFingerprint: string;
 }
 
+export interface CodexOpenSignInput {
+  scope: string;
+  chatId: string;
+  operatorOpenId: string;
+  threadId: string;
+  policyFingerprint: string;
+  ttlMs: number;
+}
+
+export interface CodexOpenVerifyExpected {
+  scope: string;
+  chatId: string;
+  operatorOpenId: string;
+  policyFingerprint: string;
+}
+
+export interface CodexOpenPayload {
+  s: string;
+  c: string;
+  o: string;
+  t: string;
+  exp: number;
+  fp: string;
+  n: string;
+  kv: number;
+}
+
+export type CodexOpenVerifyResult =
+  | { ok: true; payload: CodexOpenPayload }
+  | { ok: false; reason: CallbackVerifyFailureReason };
+
 export interface CallbackPayload {
   r: string;
   s: string;
@@ -59,7 +90,13 @@ export type CallbackVerifyResult =
         | 'nonce-revoked';
     };
 
+export type CallbackVerifyFailureReason = Extract<
+  CallbackVerifyResult,
+  { ok: false }
+>['reason'];
+
 const PREFIX = 'bridge_cb.v1';
+const CODEX_OPEN_PREFIX = 'bridge_codex_open.v1';
 
 export class CallbackAuth {
   private readonly keys: CallbackKey[];
@@ -122,6 +159,51 @@ export class CallbackAuth {
     return { ok: true, payload };
   }
 
+  /**
+   * Sign a detached Codex-open action. Unlike run controls, this remains
+   * verifiable after the run has left ActiveRuns, so completed and historical
+   * cards keep working. The callback value contains only this authenticated,
+   * opaque token; it never accepts a caller-supplied URL.
+   */
+  signCodexOpen(input: CodexOpenSignInput): string {
+    const key = this.signingKey();
+    const payload: CodexOpenPayload = {
+      s: input.scope,
+      c: input.chatId,
+      o: input.operatorOpenId,
+      t: input.threadId,
+      exp: this.now() + input.ttlMs,
+      fp: input.policyFingerprint,
+      n: this.createNonce(),
+      kv: key.version,
+    };
+    const encoded = encodeJson(payload);
+    return `${CODEX_OPEN_PREFIX}.${encoded}.${sign(encoded, key.secret)}`;
+  }
+
+  verifyCodexOpen(
+    token: string,
+    expected: CodexOpenVerifyExpected,
+  ): CodexOpenVerifyResult {
+    const parsed = parseSignedToken<CodexOpenPayload>(token, CODEX_OPEN_PREFIX, this.keys);
+    if (!parsed.ok) return parsed;
+    const payload = parsed.payload;
+    if (payload.exp <= this.now()) return { ok: false, reason: 'expired' };
+    if (
+      payload.s !== expected.scope ||
+      payload.c !== expected.chatId ||
+      payload.o !== expected.operatorOpenId ||
+      payload.fp !== expected.policyFingerprint
+    ) {
+      return { ok: false, reason: 'context-mismatch' };
+    }
+    const nonceState = this.nonceStore.state(payload.n);
+    if (nonceState === 'revoked') return { ok: false, reason: 'nonce-revoked' };
+    if (nonceState === 'used') return { ok: false, reason: 'nonce-replay' };
+    if (!this.nonceStore.consume(payload.n)) return { ok: false, reason: 'nonce-replay' };
+    return { ok: true, payload };
+  }
+
   private signingKey(): CallbackKey {
     const active = this.keys.filter((key) => !key.retired);
     const key = active.at(-1);
@@ -144,8 +226,45 @@ function matchesExpected(
   );
 }
 
-function encodeJson(payload: CallbackPayload): string {
+function encodeJson(payload: CallbackPayload | CodexOpenPayload): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function parseSignedToken<T extends CodexOpenPayload>(
+  token: string,
+  prefix: string,
+  keys: CallbackKey[],
+): { ok: true; payload: T } | { ok: false; reason: Exclude<CallbackVerifyResult, { ok: true }>['reason'] } {
+  const parts = token.split('.');
+  if (parts.length !== 4 || `${parts[0]}.${parts[1]}` !== prefix) {
+    return { ok: false, reason: 'malformed' };
+  }
+  const encoded = parts[2];
+  const signature = parts[3];
+  if (!encoded || !signature) return { ok: false, reason: 'malformed' };
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Partial<T>;
+    if (
+      typeof payload.s !== 'string' ||
+      typeof payload.c !== 'string' ||
+      typeof payload.o !== 'string' ||
+      typeof payload.t !== 'string' ||
+      typeof payload.exp !== 'number' ||
+      typeof payload.fp !== 'string' ||
+      typeof payload.n !== 'string' ||
+      typeof payload.kv !== 'number'
+    ) {
+      return { ok: false, reason: 'malformed' };
+    }
+    const key = keys.find((candidate) => candidate.version === payload.kv);
+    if (!key) return { ok: false, reason: 'unknown-key' };
+    if (!signatureMatches(signature, sign(encoded, key.secret))) {
+      return { ok: false, reason: 'bad-signature' };
+    }
+    return { ok: true, payload: payload as T };
+  } catch {
+    return { ok: false, reason: 'malformed' };
+  }
 }
 
 function decodePayload(encoded: string): CallbackPayload | undefined {

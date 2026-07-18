@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
+import { GroupContextCursorStore } from '../../../src/session/group-context-cursor.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
 
@@ -45,6 +46,7 @@ interface FakeLarkChannel {
       v1: {
         message: {
           get: ReturnType<typeof vi.fn>;
+          list: ReturnType<typeof vi.fn>;
         };
         messageReaction: {
           create: ReturnType<typeof vi.fn>;
@@ -226,7 +228,68 @@ describe('sender identity in bridge_context', () => {
   });
 });
 
-async function createHarness(): Promise<{
+describe('Codex group history prompt integration', () => {
+  it('injects fetched group history separately after access and mention gates', async () => {
+    const h = await createHarness('codex');
+    h.channel.rawClient.im.v1.message.list.mockResolvedValue({
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: 'om_ctx_a',
+            chat_id: 'oc_chat',
+            msg_type: 'text',
+            create_time: '1760000000000',
+            sender: { id: 'ou_alice', sender_name: 'Alice', sender_type: 'user' },
+            body: { content: JSON.stringify({ text: '苹果' }) },
+          },
+          {
+            message_id: 'om_ctx_b',
+            chat_id: 'oc_chat',
+            msg_type: 'text',
+            create_time: '1760000000500',
+            sender: { id: 'ou_build_bot', sender_name: 'Build Bot', sender_type: 'app' },
+            body: { content: JSON.stringify({ text: '蓝色' }) },
+          },
+        ],
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      message({ messageId: 'om_trigger', content: '@Bridge A 和 B 是什么？', rawSenderType: 'user' }),
+    );
+    await waitFor(() => h.agent.runOptions.length === 1);
+
+    const context = readSection(h.agent.runOptions[0]?.prompt ?? '', 'group_context') as {
+      status: string;
+      messages: Array<{ content: string; senderType: string }>;
+    };
+    expect(context.status).toBe('full');
+    expect(context.messages).toMatchObject([
+      { content: '苹果', senderType: 'user' },
+      { content: '蓝色', senderType: 'bot' },
+    ]);
+    const userInput = readSection(h.agent.runOptions[0]?.prompt ?? '', 'user_input') as { text: string };
+    expect(userInput.text).toContain('A 和 B');
+    expect(userInput.text).not.toContain('苹果');
+  });
+
+  it('does not call history for a non-mentioning group message', async () => {
+    const h = await createHarness('codex');
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(
+      { ...message({ messageId: 'om_plain', content: '普通聊天' }), mentionedBot: false },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    expect(h.channel.rawClient.im.v1.message.list).not.toHaveBeenCalled();
+    expect(h.agent.runOptions).toHaveLength(0);
+  });
+});
+
+async function createHarness(agentKind: 'claude' | 'codex' = 'claude'): Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel & { handlers: MessageHandlerMap };
   agent: FakeAgentAdapter;
@@ -234,11 +297,12 @@ async function createHarness(): Promise<{
   workspaces: WorkspaceStore;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   controls: ReturnType<typeof createControls>;
+  groupContextCursors: GroupContextCursorStore;
 }> {
   const tmp = await createTmpProfile('bot-at-bot-');
   const workspace = await realpath(tmp.workspace);
   const baseProfileConfig = createDefaultProfileConfig({
-    agentKind: 'claude',
+    agentKind,
     accounts: {
       app: {
         id: 'cli_test',
@@ -250,6 +314,7 @@ async function createHarness(): Promise<{
       allowedChats: ['oc_chat'],
       allowedUsers: ['ou_user'],
     },
+    ...(agentKind === 'codex' ? { codex: { binaryPath: '/usr/local/bin/codex' } } : {}),
   });
   const profileConfig = {
     ...baseProfileConfig,
@@ -264,10 +329,11 @@ async function createHarness(): Promise<{
     events: [{ type: 'done', terminationReason: 'normal' }],
   });
   const channel = createFakeLarkChannel();
+  const groupContextCursors = new GroupContextCursorStore(join(tmp.profile, 'group-context.json'));
   sdkMock.channel = channel;
   const controls = createControls(profileConfig);
   cleanups.push(async () => {
-    await Promise.all([sessions.flush(), workspaces.flush()]);
+    await Promise.all([sessions.flush(), workspaces.flush(), groupContextCursors.flush()]);
     await tmp.cleanup();
   });
   return {
@@ -278,6 +344,7 @@ async function createHarness(): Promise<{
     workspaces,
     profileConfig,
     controls,
+    groupContextCursors,
   };
 }
 
@@ -287,11 +354,13 @@ async function startTestBridge(h: {
   sessions: SessionStore;
   workspaces: WorkspaceStore;
   controls: ReturnType<typeof createControls>;
+  groupContextCursors: GroupContextCursorStore;
 }): Promise<void> {
   const bridge = await startChannel({
     cfg: h.profileConfig,
     agent: h.agent,
     sessions: h.sessions,
+    groupContextCursors: h.groupContextCursors,
     workspaces: h.workspaces,
     controls: h.controls,
   });
@@ -318,6 +387,7 @@ function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMa
         v1: {
           message: {
             get: vi.fn(async () => ({ data: { items: [] } })),
+            list: vi.fn(async () => ({ code: 0, data: { items: [] } })),
           },
           messageReaction: {
             create: vi.fn(async () => ({ data: { reaction_id: 'reaction_1' } })),

@@ -1,11 +1,15 @@
-import { createInterface } from 'node:readline';
-import type { Readable, Writable } from 'node:stream';
-import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, join } from 'node:path';
+import { lstat, mkdir, readdir, symlink } from 'node:fs/promises';
 import type { SandboxMode } from '../../config/profile-schema';
 import { log } from '../../core/logger';
-import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
+import { mergeProcessEnv } from '../../platform/spawn';
 import { SpawnFailed } from '../../runtime/errors';
-import { prefixBridgeSystemPrompt } from '../bridge-system-prompt';
+import {
+  listCodexThreadHistory,
+  type CodexThreadHistoryEntry,
+} from '../../session/codex-history';
+import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import type {
@@ -15,8 +19,12 @@ import type {
   AgentRun,
   AgentRunOptions,
 } from '../types';
-import { buildCodexArgs } from './argv';
-import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import {
+  CodexAppServerClient,
+  type AppServerExit,
+  type CodexAppServerTransport,
+  type JsonRpcNotification,
+} from './app-server-client';
 
 export interface CodexAdapterOptions {
   binary: string;
@@ -28,13 +36,34 @@ export interface CodexAdapterOptions {
   sandbox?: SandboxMode;
   stopGraceMs?: number;
   larkChannel?: LarkChannelEnvContext;
+  client?: CodexAppServerTransport;
 }
 
-type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
+interface ThreadResponse {
+  thread?: { id?: unknown };
+  model?: unknown;
+  cwd?: unknown;
+}
+
+interface TurnResponse {
+  turn?: { id?: unknown };
+}
+
+interface TurnRuntime {
+  threadId?: string;
+  turnId?: string;
+  terminal: boolean;
+  stopRequested: boolean;
+  lastError?: string;
+  bufferedNotifications: JsonRpcNotification[];
+  textDeltaItems: Set<string>;
+  startedTools: Set<string>;
+  toolOutput: Map<string, string>;
+}
 
 export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
-  readonly displayName = 'Codex CLI';
+  readonly displayName = 'Codex App Server';
 
   private readonly binary: string;
   private readonly profileStateDir: string;
@@ -42,9 +71,12 @@ export class CodexAdapter implements AgentAdapter {
   private readonly inheritCodexHome: boolean;
   private readonly ignoreUserConfig: boolean;
   private readonly ignoreRules: boolean;
+  private readonly sourceCodexHome: string;
+  private readonly effectiveCodexHome: string | undefined;
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private readonly client: CodexAppServerTransport;
   private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: CodexAdapterOptions) {
@@ -54,13 +86,33 @@ export class CodexAdapter implements AgentAdapter {
     this.inheritCodexHome = opts.inheritCodexHome !== false;
     this.ignoreUserConfig = opts.ignoreUserConfig === true;
     this.ignoreRules = opts.ignoreRules !== false;
+    this.sourceCodexHome =
+      opts.codexHome ??
+      (this.inheritCodexHome
+        ? process.env.CODEX_HOME ?? join(homedir(), '.codex')
+        : join(this.profileStateDir, 'codex-home'));
+    this.effectiveCodexHome =
+      this.ignoreUserConfig || this.ignoreRules
+        ? join(
+            this.profileStateDir,
+            `codex-home-app-server-${this.ignoreUserConfig ? 'no-config' : 'config'}-${this.ignoreRules ? 'no-rules' : 'rules'}`,
+          )
+        : this.codexHome ?? (this.inheritCodexHome ? undefined : join(this.profileStateDir, 'codex-home'));
     this.sandbox = opts.sandbox ?? 'danger-full-access';
-    this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
+    this.defaultStopGraceMs = opts.stopGraceMs ?? 5_000;
     this.larkChannel = opts.larkChannel;
+    this.client = opts.client ?? new CodexAppServerClient({
+      binary: this.binary,
+      env: this.appServerEnv(),
+    });
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
     this.botIdentity = identity;
+  }
+
+  appServerPid(): number | undefined {
+    return this.client.pid();
   }
 
   async isAvailable(): Promise<boolean> {
@@ -70,7 +122,7 @@ export class CodexAdapter implements AgentAdapter {
   async checkAvailability(): Promise<AgentAvailability> {
     return checkAgentAvailability({
       agentId: 'codex',
-      agentName: 'Codex CLI',
+      agentName: 'Codex App Server',
       command: this.binary,
       binaryPath: this.binary,
     });
@@ -86,210 +138,491 @@ export class CodexAdapter implements AgentAdapter {
         availability.diagnostic,
       );
     }
+    try {
+      await this.prepareCompatibilityHome();
+      await this.client.ensureStarted();
+    } catch (error) {
+      throw new SpawnFailed(
+        'codex app-server preflight failed',
+        error,
+        'codex-app-server-unavailable',
+        {
+          code: 'codex-app-server-unavailable',
+          agentId: 'codex',
+          agentName: 'Codex App Server',
+          command: this.binary,
+          binaryPath: this.binary,
+          details: errorMessage(error),
+          recovery: '升级 Codex CLI，并确认 `codex app-server --listen stdio://` 可用。',
+        },
+      );
+    }
   }
 
   run(opts: AgentRunOptions): AgentRun {
-    if (!opts.cwd) {
-      throw new Error('cwd is required for CodexAdapter.run');
-    }
+    if (!opts.cwd) throw new Error('cwd is required for CodexAdapter.run');
 
-    const args = buildCodexArgs({
-      cwd: opts.cwd,
-      sandbox: opts.sandbox ?? this.sandbox,
-      threadId: opts.threadId,
-      images: opts.images,
-      ignoreUserConfig: this.ignoreUserConfig,
-      ignoreRules: this.ignoreRules,
-      model: opts.model,
+    const queue = new AsyncEventQueue<AgentEvent>();
+    const runtime: TurnRuntime = {
+      terminal: false,
+      stopRequested: false,
+      bufferedNotifications: [],
+      textDeltaItems: new Set(),
+      startedTools: new Set(),
+      toolOutput: new Map(),
+    };
+    let settled = false;
+    let settleExit!: () => void;
+    const exited = new Promise<void>((resolve) => {
+      settleExit = resolve;
     });
-    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
-    if (this.codexHome) {
-      envOverrides.CODEX_HOME = this.codexHome;
-    } else if (!this.inheritCodexHome) {
-      envOverrides.CODEX_HOME = join(this.profileStateDir, 'codex-home');
-    }
-    const child = spawnProcess(this.binary, args, {
-      cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, envOverrides),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }) as CodexChild;
-
-    log.info('agent', 'spawn', {
-      pid: child.pid ?? null,
-      cwd: opts.cwd,
-      hasThread: Boolean(opts.threadId),
-      promptChars: opts.prompt.length,
-      images: opts.images?.length ?? 0,
-      model: opts.model,
-    });
-
-    const stderrChunks: Buffer[] = [];
-    let runtimeError: Error | null = null;
-    let stderrBuffer = '';
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderrChunks.push(chunk);
-      stderrBuffer += chunk.toString('utf8');
-      let nl = stderrBuffer.indexOf('\n');
-      while (nl !== -1) {
-        const line = stderrBuffer.slice(0, nl);
-        stderrBuffer = stderrBuffer.slice(nl + 1);
-        if (line.trim()) log.warn('agent', 'stderr', { line });
-        if (isWindowsCommandNotFoundLine(line)) {
-          runtimeError = new Error(`failed to spawn codex: ${line.trim()}`);
-          child.stdout.destroy();
-          child.kill();
-        }
-        nl = stderrBuffer.indexOf('\n');
+    const terminal = (event: AgentEvent): void => {
+      if (runtime.terminal) return;
+      runtime.terminal = true;
+      queue.push(event);
+      queue.close();
+      if (!settled) {
+        settled = true;
+        settleExit();
       }
+    };
+
+    const unsubscribeNotification = this.client.onNotification((notification) => {
+      if (!runtime.threadId || !runtime.turnId) {
+        runtime.bufferedNotifications.push(notification);
+        return;
+      }
+      this.translateNotification(notification, runtime, queue, terminal);
+    });
+    const unsubscribeExit = this.client.onExit((exit) => {
+      if (!exit.expected && !runtime.terminal) terminal(appServerExitError(exit));
     });
 
-    let stopReason: CodexFinishReason | undefined;
-    child.on('error', (err) => {
-      runtimeError = err;
-    });
-    child.on('exit', (code, signal) => {
-      log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
-    });
-    child.stdin.on('error', (err) => {
-      log.warn('agent', 'stdin-error', { message: err.message });
-    });
-    child.stdin.end(prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
+    const start = async (): Promise<void> => {
+      try {
+        await this.client.ensureStarted();
+        const sandbox = opts.sandbox ?? this.sandbox;
+        const commonThreadParams = {
+          cwd: opts.cwd!,
+          approvalPolicy: 'never',
+          sandbox,
+          ...(opts.model ? { model: opts.model } : {}),
+          developerInstructions: buildBridgeSystemPrompt(this.botIdentity),
+        };
+        const thread = opts.threadId
+          ? await this.client.request<ThreadResponse>('thread/resume', {
+              threadId: opts.threadId,
+              ...commonThreadParams,
+            })
+          : await this.client.request<ThreadResponse>('thread/start', commonThreadParams);
+        const threadId = stringValue(thread.thread?.id);
+        if (!threadId) throw new Error('codex app-server returned no thread id');
+        runtime.threadId = threadId;
+        queue.push({
+          type: 'system',
+          threadId,
+          cwd: stringValue(thread.cwd) ?? opts.cwd,
+          ...(stringValue(thread.model) ? { model: stringValue(thread.model) } : {}),
+        });
 
-    const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
+        const turn = await this.client.request<TurnResponse>('turn/start', {
+          threadId,
+          input: [
+            { type: 'text', text: opts.prompt, text_elements: [] },
+            ...(opts.images ?? []).map((path) => ({ type: 'localImage', path })),
+          ],
+          cwd: opts.cwd,
+          approvalPolicy: 'never',
+          sandboxPolicy: sandboxPolicy(sandbox, opts.cwd!),
+          ...(opts.model ? { model: opts.model } : {}),
+        });
+        const turnId = stringValue(turn.turn?.id);
+        if (!turnId) throw new Error('codex app-server returned no turn id');
+        runtime.turnId = turnId;
+        queue.push({ type: 'system', threadId, turnId, cwd: opts.cwd });
+
+        try {
+          await opts.onTurnAccepted?.({ threadId, turnId });
+        } catch (error) {
+          log.warn('context', 'cursor-commit-failed', { message: errorMessage(error) });
+        }
+
+        const buffered = runtime.bufferedNotifications.splice(0);
+        for (const notification of buffered) {
+          this.translateNotification(notification, runtime, queue, terminal);
+        }
+        if (runtime.stopRequested && !runtime.terminal) {
+          await this.interrupt(runtime);
+        }
+      } catch (error) {
+        terminal({
+          type: 'error',
+          message: errorMessage(error),
+          terminationReason: runtime.stopRequested ? 'interrupted' : 'failed',
+        });
+      }
+    };
+    void start();
+
+    const cleanup = (): void => {
+      unsubscribeNotification();
+      unsubscribeExit();
+    };
+    void exited.then(cleanup);
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason),
-      async stop() {
-        if (child.exitCode !== null || child.signalCode !== null) return;
-        stopReason = 'interrupted';
-        log.info('agent', 'stop-sigterm', { pid: child.pid ?? null, graceMs: stopGraceMs });
-        child.kill('SIGTERM');
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            if (child.exitCode === null && child.signalCode === null) {
-              log.warn('agent', 'stop-sigkill', {
-                pid: child.pid ?? null,
-                graceMs: stopGraceMs,
-                reason: 'grace-period-expired',
-              });
-              child.kill('SIGKILL');
-            }
-            resolve();
-          }, stopGraceMs);
-          child.once('exit', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      },
-      waitForExit(timeoutMs: number): Promise<boolean> {
-        if (child.exitCode !== null || child.signalCode !== null) {
-          return Promise.resolve(true);
+      events: queue,
+      stop: async () => {
+        runtime.stopRequested = true;
+        if (runtime.threadId && runtime.turnId && !runtime.terminal) {
+          await this.interrupt(runtime);
         }
-        return new Promise<boolean>((resolve) => {
-          const onExit = (): void => {
-            clearTimeout(timer);
-            resolve(true);
-          };
-          const timer = setTimeout(() => {
-            child.removeListener('exit', onExit);
-            resolve(false);
-          }, timeoutMs);
-          child.once('exit', onExit);
-        });
+      },
+      async waitForExit(timeoutMs: number): Promise<boolean> {
+        if (settled) return true;
+        return Promise.race([
+          exited.then(() => true),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+        ]);
       },
     };
   }
-}
 
-async function* createEventStream(
-  child: CodexChild,
-  stderrChunks: Buffer[],
-  getError: () => Error | null,
-  getStopReason: () => CodexFinishReason | undefined,
-): AsyncGenerator<AgentEvent> {
-  const translator = new CodexJsonlTranslator();
-  if (!child.pid) {
-    const err = getError();
-    yield {
-      type: 'error',
-      message: err ? `failed to spawn codex: ${err.message}` : 'spawn returned no pid',
-      terminationReason: 'failed',
-    };
-    return;
+  async close(): Promise<void> {
+    await this.client.close();
   }
 
-  const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  let sawStdout = false;
-  let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
-  const closeSilentStdout = (): void => {
-    silentExitTimer = setTimeout(() => {
-      if (!sawStdout && !child.stdout.readableEnded) child.stdout.destroy();
-    }, 50);
-  };
-  child.once('exit', closeSilentStdout);
-  try {
-    for await (const line of rl) {
-      sawStdout = true;
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
+  async listThreadHistory(input: {
+    cwd: string;
+    limit: number;
+    timeoutMs?: number;
+  }): Promise<CodexThreadHistoryEntry[]> {
+    await this.prepareCompatibilityHome();
+    return listCodexThreadHistory(input, this.client);
+  }
+
+  private async interrupt(runtime: TurnRuntime): Promise<void> {
+    if (!runtime.threadId || !runtime.turnId || runtime.terminal) return;
+    try {
+      await this.client.request(
+        'turn/interrupt',
+        { threadId: runtime.threadId, turnId: runtime.turnId },
+        this.defaultStopGraceMs,
+      );
+    } catch (error) {
+      if (!runtime.terminal) throw error;
+    }
+  }
+
+  private translateNotification(
+    notification: JsonRpcNotification,
+    runtime: TurnRuntime,
+    queue: AsyncEventQueue<AgentEvent>,
+    terminal: (event: AgentEvent) => void,
+  ): void {
+    if (runtime.terminal) return;
+    const params = recordValue(notification.params);
+    if (!params || params.threadId !== runtime.threadId) return;
+    const notificationTurnId = stringValue(params.turnId) ?? stringValue(recordValue(params.turn)?.id);
+    if (notificationTurnId && notificationTurnId !== runtime.turnId) return;
+
+    switch (notification.method) {
+      case 'turn/started':
+        return;
+      case 'item/agentMessage/delta': {
+        const itemId = stringValue(params.itemId);
+        const delta = stringValue(params.delta);
+        if (itemId && delta) {
+          runtime.textDeltaItems.add(itemId);
+          queue.push({ type: 'text', delta });
+        }
+        return;
+      }
+      case 'item/reasoning/summaryTextDelta':
+      case 'item/reasoning/textDelta': {
+        const delta = stringValue(params.delta);
+        if (delta) queue.push({ type: 'thinking', delta });
+        return;
+      }
+      case 'item/commandExecution/outputDelta':
+      case 'item/fileChange/outputDelta': {
+        const itemId = stringValue(params.itemId);
+        const delta = stringValue(params.delta);
+        if (itemId && delta) {
+          runtime.toolOutput.set(itemId, `${runtime.toolOutput.get(itemId) ?? ''}${delta}`);
+        }
+        return;
+      }
+      case 'item/started': {
+        const item = recordValue(params.item);
+        const mapped = item ? toolStartEvent(item) : undefined;
+        if (mapped) {
+          runtime.startedTools.add(mapped.id);
+          queue.push(mapped);
+        }
+        return;
+      }
+      case 'item/completed': {
+        const item = recordValue(params.item);
+        if (!item) return;
+        const itemId = stringValue(item.id);
+        if (item.type === 'agentMessage') {
+          const text = stringValue(item.text);
+          if (text) queue.push({ type: 'final_text', content: text });
+          return;
+        }
+        const mapped = toolResultEvent(item, runtime.toolOutput.get(itemId ?? ''));
+        if (mapped) queue.push(mapped);
+        return;
+      }
+      case 'thread/tokenUsage/updated': {
+        const last = recordValue(recordValue(params.tokenUsage)?.last);
+        if (last) {
+          queue.push({
+            type: 'usage',
+            inputTokens: numberValue(last.inputTokens),
+            outputTokens: numberValue(last.outputTokens),
+            cachedInputTokens: numberValue(last.cachedInputTokens),
+            reasoningOutputTokens: numberValue(last.reasoningOutputTokens),
+          });
+        }
+        return;
+      }
+      case 'error': {
+        const error = recordValue(params.error);
+        runtime.lastError = stringValue(error?.message) ?? 'codex app-server error';
+        log.warn('app-server', 'turn-error-notification', {
+          willRetry: params.willRetry === true,
+          message: runtime.lastError,
+        });
+        return;
+      }
+      case 'turn/completed': {
+        const turn = recordValue(params.turn);
+        const status = stringValue(turn?.status);
+        if (status === 'completed') {
+          terminal({ type: 'done', threadId: runtime.threadId, terminationReason: 'normal' });
+        } else if (status === 'interrupted') {
+          terminal({ type: 'done', threadId: runtime.threadId, terminationReason: 'interrupted' });
+        } else {
+          const turnError = recordValue(turn?.error);
+          terminal({
+            type: 'error',
+            message:
+              stringValue(turnError?.message) ?? runtime.lastError ?? 'codex turn failed',
+            terminationReason: 'failed',
+          });
+        }
+        return;
+      }
+      default:
+        if (isTurnNotification(notification.method)) {
+          log.warn('app-server', 'unknown-turn-notification', { method: notification.method });
+        }
+    }
+  }
+
+  private appServerEnv(): NodeJS.ProcessEnv {
+    const overrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
+    if (this.effectiveCodexHome) overrides.CODEX_HOME = this.effectiveCodexHome;
+    return mergeProcessEnv(process.env, overrides);
+  }
+
+  /**
+   * App Server has no `--ignore-user-config` / `--ignore-rules` flags. Build a
+   * private CODEX_HOME view that shares durable auth/session state with the
+   * configured home while omitting only the requested config/rules entries.
+   * Symlinks keep desktop deep links and thread history on the same store.
+   */
+  private async prepareCompatibilityHome(): Promise<void> {
+    if (!this.effectiveCodexHome || (!this.ignoreUserConfig && !this.ignoreRules)) return;
+    await mkdir(this.effectiveCodexHome, { recursive: true, mode: 0o700 });
+    let entries;
+    try {
+      entries = await readdir(this.sourceCodexHome, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (shouldOmitCompatibilityEntry(entry.name, this.ignoreUserConfig, this.ignoreRules)) {
         continue;
       }
-      yield* translator.translate(parsed);
+      const source = join(this.sourceCodexHome, entry.name);
+      const target = join(this.effectiveCodexHome, entry.name);
+      try {
+        await lstat(target);
+        continue;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      try {
+        await symlink(source, target, entry.isDirectory() ? (process.platform === 'win32' ? 'junction' : 'dir') : 'file');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw new Error(
+            `failed to prepare Codex App Server compatibility home entry ${basename(source)}: ${errorMessage(error)}`,
+            { cause: error },
+          );
+        }
+      }
     }
-  } finally {
-    if (silentExitTimer) clearTimeout(silentExitTimer);
-    child.removeListener('exit', closeSilentStdout);
-    rl.close();
   }
-
-  const earlyRuntimeError = getError();
-  if (earlyRuntimeError && child.exitCode === null && child.signalCode === null) {
-    yield* translator.fail(`codex runtime error: ${earlyRuntimeError.message}`);
-    return;
-  }
-
-  const exitCode = await waitForExitCode(child);
-  const stopReason = getStopReason();
-  if (stopReason) {
-    yield* translator.finish(stopReason);
-    return;
-  }
-
-  const runtimeError = getError();
-  if (exitCode !== 0 && exitCode !== null) {
-    if (!translator.terminalEmitted()) {
-      const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-      const detail = stderr ? `: ${stderr.slice(0, 500)}` : '';
-      yield* translator.fail(`codex exited with code ${exitCode}${detail}`);
-    }
-    return;
-  }
-  if (runtimeError && !translator.terminalEmitted()) {
-    yield* translator.fail(`codex runtime error: ${runtimeError.message}`);
-    return;
-  }
-
-  yield* translator.finish();
 }
 
-async function waitForExitCode(child: CodexChild): Promise<number | null> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return child.exitCode;
-  }
-  return new Promise<number | null>((resolve) => {
-    child.once('exit', (code) => resolve(code));
-  });
+const VOLATILE_CODEX_HOME_ENTRIES = new Set([
+  'app-server-control',
+  'app-server-daemon',
+  'ipc',
+  'log',
+  'shell_snapshots',
+  'tmp',
+]);
+
+function shouldOmitCompatibilityEntry(
+  name: string,
+  ignoreUserConfig: boolean,
+  ignoreRules: boolean,
+): boolean {
+  if (VOLATILE_CODEX_HOME_ENTRIES.has(name)) return true;
+  if (ignoreRules && name === 'rules') return true;
+  return ignoreUserConfig && (name === 'config.toml' || name.startsWith('config.toml.'));
 }
 
-function isWindowsCommandNotFoundLine(line: string): boolean {
-  return (
-    process.platform === 'win32' &&
-    /is not recognized as an internal or external command|operable program or batch file/i.test(line)
-  );
+function sandboxPolicy(mode: SandboxMode, cwd: string): Record<string, unknown> {
+  if (mode === 'danger-full-access') return { type: 'dangerFullAccess' };
+  if (mode === 'read-only') return { type: 'readOnly', networkAccess: false };
+  return {
+    type: 'workspaceWrite',
+    writableRoots: [cwd],
+    networkAccess: true,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  };
+}
+
+function toolStartEvent(
+  item: Record<string, unknown>,
+): Extract<AgentEvent, { type: 'tool_use' }> | undefined {
+  const id = stringValue(item.id);
+  const type = stringValue(item.type);
+  if (!id || !type || type === 'agentMessage' || type === 'reasoning' || type === 'userMessage') {
+    return undefined;
+  }
+  if (type === 'commandExecution') {
+    return {
+      type: 'tool_use',
+      id,
+      name: 'command_execution',
+      input: { command: stringValue(item.command) ?? '' },
+    };
+  }
+  if (type === 'fileChange') {
+    return { type: 'tool_use', id, name: 'file_change', input: item.changes ?? [] };
+  }
+  if (type === 'mcpToolCall') {
+    return {
+      type: 'tool_use',
+      id,
+      name: `${stringValue(item.server) ?? 'mcp'}.${stringValue(item.tool) ?? 'tool'}`,
+      input: item.arguments,
+    };
+  }
+  return { type: 'tool_use', id, name: camelToSnake(type), input: item };
+}
+
+function toolResultEvent(
+  item: Record<string, unknown>,
+  streamedOutput: string | undefined,
+): Extract<AgentEvent, { type: 'tool_result' }> | undefined {
+  const id = stringValue(item.id);
+  const type = stringValue(item.type);
+  if (!id || !type || type === 'agentMessage' || type === 'reasoning' || type === 'userMessage') {
+    return undefined;
+  }
+  const status = stringValue(item.status);
+  const isError = status === 'failed' || status === 'declined';
+  let output = streamedOutput ?? '';
+  if (!output && type === 'commandExecution') output = stringValue(item.aggregatedOutput) ?? '';
+  if (!output && type === 'fileChange') output = stringify(item.changes ?? []);
+  if (!output && type === 'mcpToolCall') output = stringify(item.result ?? item.error ?? '');
+  if (!output) output = stringify(item);
+  return { type: 'tool_result', id, output, isError };
+}
+
+function appServerExitError(exit: AppServerExit): AgentEvent {
+  return {
+    type: 'error',
+    message: `codex app-server exited unexpectedly${exit.code !== null ? ` with code ${exit.code}` : exit.signal ? ` by ${exit.signal}` : ''}`,
+    terminationReason: 'failed',
+  };
+}
+
+function isTurnNotification(method: string): boolean {
+  return method === 'error' || method.startsWith('turn/') || method.startsWith('item/');
+}
+
+function recordValue(input: unknown): Record<string, unknown> | undefined {
+  return input && typeof input === 'object' && !Array.isArray(input)
+    ? (input as Record<string, unknown>)
+    : undefined;
+}
+
+function stringValue(input: unknown): string | undefined {
+  return typeof input === 'string' && input.length > 0 ? input : undefined;
+}
+
+function numberValue(input: unknown): number | undefined {
+  return typeof input === 'number' && Number.isFinite(input) ? input : undefined;
+}
+
+function stringify(input: unknown): string {
+  if (typeof input === 'string') return input;
+  try {
+    return JSON.stringify(input) ?? '';
+  } catch {
+    return String(input);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function camelToSnake(value: string): string {
+  return value.replace(/[A-Z]/g, (match) => `_${match.toLowerCase()}`);
+}
+
+class AsyncEventQueue<T> implements AsyncIterable<T> {
+  private readonly values: T[] = [];
+  private readonly waiters: Array<() => void> = [];
+  private ended = false;
+
+  push(value: T): void {
+    if (this.ended) return;
+    this.values.push(value);
+    this.wake();
+  }
+
+  close(): void {
+    this.ended = true;
+    this.wake();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<T> {
+    while (true) {
+      const value = this.values.shift();
+      if (value !== undefined) {
+        yield value;
+        continue;
+      }
+      if (this.ended) return;
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+  }
+
+  private wake(): void {
+    for (const waiter of this.waiters.splice(0)) waiter();
+  }
 }

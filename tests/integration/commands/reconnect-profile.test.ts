@@ -64,7 +64,8 @@ describe('/reconnect profile lifecycle', () => {
     expect(disconnectBlock).toContain('await Promise.allSettled([');
     expect(disconnectBlock).toContain('channel.disconnect()');
     expect(disconnectBlock).toContain('activeRuns.stopAll()');
-    expect(source).toContain('sessionCatalogIdentity: await commandSessionCatalogIdentity({');
+    expect(source).toContain('const catalogIdentity = await commandSessionCatalogIdentity({');
+    expect(source).toContain('sessionCatalogIdentity: catalogIdentity');
   });
 });
 

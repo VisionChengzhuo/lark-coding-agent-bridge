@@ -18,6 +18,7 @@ export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | null;
 export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_timeout';
 
 export interface RunState {
+  threadId?: string;
   blocks: Block[];
   finalText?: string;
   reasoning: { content: string; active: boolean };
@@ -44,6 +45,8 @@ function closeStreamingText(blocks: Block[]): Block[] {
 
 export function reduce(state: RunState, evt: AgentEvent): RunState {
   switch (evt.type) {
+    case 'system':
+      return evt.threadId ? { ...state, threadId: evt.threadId } : state;
     case 'text': {
       const last = state.blocks[state.blocks.length - 1];
       if (last && last.kind === 'text' && last.streaming) {
