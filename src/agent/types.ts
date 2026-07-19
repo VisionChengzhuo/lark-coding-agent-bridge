@@ -42,6 +42,8 @@ export interface AgentRunOptions {
   sessionId?: string;
   threadId?: string;
   model?: string;
+  /** Codex reasoning effort override for this turn and subsequent turns. */
+  reasoningEffort?: string;
   images?: readonly string[];
   sandbox?: CodexSandboxMode;
   permissionMode?: ClaudePermissionMode;
@@ -56,6 +58,21 @@ export interface AgentRunOptions {
   /** Called only after the runtime has accepted the turn. Used for durable
    * cursors whose state must not advance when submission fails. */
   onTurnAccepted?: (input: { threadId: string; turnId: string }) => void | Promise<void>;
+}
+
+export interface AgentReasoningEffortOption {
+  value: string;
+  description: string;
+}
+
+/** A model exposed by the active agent/account rather than a static bridge catalog. */
+export interface AgentModelOption {
+  value: string;
+  label: string;
+  description: string;
+  isDefault: boolean;
+  defaultReasoningEffort?: string;
+  supportedReasoningEfforts: AgentReasoningEffortOption[];
 }
 
 export interface AgentRun {
@@ -109,6 +126,8 @@ export interface AgentAdapter {
     limit: number;
     timeoutMs?: number;
   }): Promise<AgentThreadHistoryEntry[]>;
+  /** Return models currently available to the signed-in account, when supported. */
+  listModels?(): Promise<AgentModelOption[]>;
   close?(): Promise<void>;
   /**
    * Late-bound identity injection: the adapter is constructed before the

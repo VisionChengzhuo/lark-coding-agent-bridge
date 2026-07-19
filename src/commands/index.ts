@@ -5,7 +5,7 @@ import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
-import type { AgentAdapter } from '../agent/types';
+import type { AgentAdapter, AgentModelOption } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
   accountCurrentCard,
@@ -24,7 +24,12 @@ import {
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
-import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
+import {
+  helpCard,
+  resumeCard,
+  statusCard,
+  workspacesCard,
+} from '../card/templates';
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -174,6 +179,8 @@ const handlers: Record<string, Handler> = {
   '/cd': handleCd,
   '/ws': handleWs,
   '/resume': handleResume,
+  '/model': handleModel,
+  '/effort': handleEffort,
   '/status': handleStatus,
   '/help': handleHelp,
   '/account': handleAccount,
@@ -1739,6 +1746,152 @@ async function saveAccessConfig(
     reportMetric('command_fail', 1, { step: 'access.save' });
     throw err;
   }
+}
+
+// ────────────── /model + /effort — per-scope Codex controls ──────────────
+
+async function handleModel(args: string, ctx: CommandContext): Promise<void> {
+  if (!(await ensureCodexPickerContext(ctx))) return;
+  const models = await loadCodexModels(ctx);
+  if (!models) return;
+
+  const value = args.trim();
+  const scopeModel = ctx.sessions.getModel(ctx.scope);
+  const effective = effectiveCatalogModel(ctx, models, scopeModel);
+  if (!value) {
+    const options = models.map((model) => `- \`${model.value}\` — ${model.label}`).join('\n');
+    await reply(
+      ctx,
+      `当前模型：\`${effective.label}\`${scopeModel ? '' : '（跟随默认）'}\n\n${options}\n\n切换：\`/model <模型值>\`；恢复默认：\`/model default\`。`,
+    );
+    return;
+  }
+  if (value !== DEFAULT_MODEL && !models.some((model) => model.value === value)) {
+    await reply(ctx, `未知模型：\`${value}\`。请点击 \`/model\` 下拉菜单查看可选值。`);
+    return;
+  }
+
+  const selected =
+    value === DEFAULT_MODEL
+      ? effectiveCatalogModel(ctx, models, undefined)
+      : models.find((model) => model.value === value)!;
+  ctx.sessions.setModel(ctx.scope, value === DEFAULT_MODEL ? undefined : value);
+
+  const currentEffort = ctx.sessions.getReasoningEffort(ctx.scope);
+  const effortStillSupported = selected.supportedReasoningEfforts.some(
+    (effort) => effort.value === currentEffort,
+  );
+  if (currentEffort && !effortStillSupported) {
+    ctx.sessions.setReasoningEffort(ctx.scope, undefined);
+  }
+  await reply(
+    ctx,
+    value === DEFAULT_MODEL
+      ? `✅ 已恢复跟随默认模型（当前有效模型：\`${selected.label}\`）。`
+      : `✅ 当前私聊已切换为 \`${selected.label}\`。${currentEffort && !effortStillSupported ? '\n原推理强度不受新模型支持，已恢复跟随模型默认。' : ''}`,
+  );
+}
+
+async function handleEffort(args: string, ctx: CommandContext): Promise<void> {
+  if (!(await ensureCodexPickerContext(ctx))) return;
+  const models = await loadCodexModels(ctx);
+  if (!models) return;
+  const model = effectiveCatalogModel(ctx, models, ctx.sessions.getModel(ctx.scope));
+  if (model.supportedReasoningEfforts.length === 0) {
+    await reply(ctx, `当前模型 \`${model.label}\` 没有可选择的推理强度。`);
+    return;
+  }
+
+  const value = args.trim();
+  const currentEffort = ctx.sessions.getReasoningEffort(ctx.scope);
+  const defaultEffort = model.defaultReasoningEffort ?? 'Codex 默认';
+  if (!value) {
+    const effectiveEffort = currentEffort ?? defaultEffort;
+    const options = model.supportedReasoningEfforts
+      .map((effort) => `- \`${effort.value}\` — ${effortLabel(effort.value)}`)
+      .join('\n');
+    await reply(
+      ctx,
+      `当前模型：\`${model.label}\`\n当前推理强度：\`${effortLabel(effectiveEffort)}\`${currentEffort ? '' : '（跟随模型默认）'}\n\n${options}\n\n切换：\`/effort <强度值>\`；恢复默认：\`/effort default\`。`,
+    );
+    return;
+  }
+  if (
+    value !== DEFAULT_MODEL &&
+    !model.supportedReasoningEfforts.some((effort) => effort.value === value)
+  ) {
+    await reply(
+      ctx,
+      `当前模型 \`${model.label}\` 不支持推理强度 \`${value}\`。请点击 \`/effort\` 下拉菜单查看可选值。`,
+    );
+    return;
+  }
+  ctx.sessions.setReasoningEffort(ctx.scope, value === DEFAULT_MODEL ? undefined : value);
+  const effectiveEffort =
+    value === DEFAULT_MODEL ? model.defaultReasoningEffort ?? 'Codex 默认' : value;
+  await reply(
+    ctx,
+    value === DEFAULT_MODEL
+      ? `✅ 已恢复跟随模型默认推理强度（当前：\`${effortLabel(effectiveEffort)}\`）。`
+      : `✅ 当前私聊的推理强度已切换为 \`${effortLabel(effectiveEffort)}\`。`,
+  );
+}
+
+async function ensureCodexPickerContext(ctx: CommandContext): Promise<boolean> {
+  if (ctx.chatMode !== 'p2p') {
+    await reply(ctx, '请在与 Mac Codex bot 的私聊中使用这个命令。');
+    return false;
+  }
+  if (ctx.controls.profileConfig.agentKind !== 'codex' || ctx.agent.id !== 'codex') {
+    await reply(ctx, '这个命令只适用于 Codex profile。');
+    return false;
+  }
+  if (!ctx.agent.listModels) {
+    await reply(ctx, '当前 Codex 版本不支持读取模型列表，请升级后重试。');
+    return false;
+  }
+  return true;
+}
+
+async function loadCodexModels(ctx: CommandContext): Promise<AgentModelOption[] | undefined> {
+  try {
+    const models = await ctx.agent.listModels!();
+    if (models.length === 0) throw new Error('Codex 没有返回可用模型');
+    return models;
+  } catch (error) {
+    log.fail('command', error, { cmd: 'model/list' });
+    await reply(
+      ctx,
+      `读取 Codex 模型列表失败：${error instanceof Error ? error.message : String(error)}`,
+    );
+    return undefined;
+  }
+}
+
+function effectiveCatalogModel(
+  ctx: CommandContext,
+  models: AgentModelOption[],
+  scopeModel: string | undefined,
+): AgentModelOption {
+  const configured = scopeModel ?? ctx.controls.profileConfig.preferences.model;
+  return (
+    models.find((model) => model.value === configured) ??
+    models.find((model) => model.isDefault) ??
+    models[0]!
+  );
+}
+
+function effortLabel(value: string): string {
+  const labels: Record<string, string> = {
+    minimal: 'Minimal（最小）',
+    low: 'Low（低）',
+    medium: 'Medium（中）',
+    high: 'High（高）',
+    xhigh: 'XHigh（超高）',
+    max: 'Max（最大）',
+    ultra: 'Ultra（自动委派）',
+  };
+  return labels[value] ?? value;
 }
 
 // ────────────── /config — preferences form ──────────────

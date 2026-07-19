@@ -14,6 +14,10 @@ export interface SessionEntry {
    * scope, undefined = follow global default. Session resets preserve this
    * scope preference while removing the resumable session id/cwd. */
   idleTimeoutMinutes?: number;
+  /** Per-scope model override. Undefined follows the profile/agent default. */
+  model?: string;
+  /** Per-scope Codex reasoning effort override. Undefined follows the model default. */
+  reasoningEffort?: string;
 }
 
 type SessionMap = Record<string, SessionEntry>;
@@ -43,13 +47,25 @@ export class SessionStore {
         const cwd = typeof entry.cwd === 'string' ? entry.cwd : undefined;
         const idleTimeoutMinutes =
           typeof entry.idleTimeoutMinutes === 'number' ? entry.idleTimeoutMinutes : undefined;
+        const model = typeof entry.model === 'string' && entry.model ? entry.model : undefined;
+        const reasoningEffort =
+          typeof entry.reasoningEffort === 'string' && entry.reasoningEffort
+            ? entry.reasoningEffort
+            : undefined;
         const hasSession = sessionId !== undefined && cwd !== undefined;
-        if (!hasSession && idleTimeoutMinutes === undefined) continue;
+        if (
+          !hasSession &&
+          idleTimeoutMinutes === undefined &&
+          model === undefined &&
+          reasoningEffort === undefined
+        ) continue;
         this.data[chatId] = {
           ...(sessionId !== undefined ? { sessionId } : {}),
           ...(cwd !== undefined ? { cwd } : {}),
           updatedAt: entry.updatedAt,
           ...(idleTimeoutMinutes !== undefined ? { idleTimeoutMinutes } : {}),
+          ...(model !== undefined ? { model } : {}),
+          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
         };
       }
     } catch (err) {
@@ -75,8 +91,7 @@ export class SessionStore {
   }
 
   set(chatId: string, sessionId: string, cwd: string): void {
-    // Preserve idleTimeoutMinutes across run starts — it's a per-scope
-    // preference, not per-run-instance state. /new (clear) wipes it.
+    // Preserve per-scope preferences across run starts.
     const prev = this.data[chatId];
     this.data[chatId] = {
       sessionId,
@@ -85,6 +100,10 @@ export class SessionStore {
       ...(prev?.idleTimeoutMinutes !== undefined
         ? { idleTimeoutMinutes: prev.idleTimeoutMinutes }
         : {}),
+      ...(prev?.model !== undefined ? { model: prev.model } : {}),
+      ...(prev?.reasoningEffort !== undefined
+        ? { reasoningEffort: prev.reasoningEffort }
+        : {}),
     };
     this.schedulePersist();
   }
@@ -92,10 +111,20 @@ export class SessionStore {
   clear(chatId: string): void {
     const prev = this.data[chatId];
     if (!prev) return;
-    if (prev.idleTimeoutMinutes !== undefined) {
+    if (
+      prev.idleTimeoutMinutes !== undefined ||
+      prev.model !== undefined ||
+      prev.reasoningEffort !== undefined
+    ) {
       this.data[chatId] = {
-        idleTimeoutMinutes: prev.idleTimeoutMinutes,
         updatedAt: Date.now(),
+        ...(prev.idleTimeoutMinutes !== undefined
+          ? { idleTimeoutMinutes: prev.idleTimeoutMinutes }
+          : {}),
+        ...(prev.model !== undefined ? { model: prev.model } : {}),
+        ...(prev.reasoningEffort !== undefined
+          ? { reasoningEffort: prev.reasoningEffort }
+          : {}),
       };
     } else {
       delete this.data[chatId];
@@ -130,6 +159,22 @@ export class SessionStore {
     return true;
   }
 
+  getModel(chatId: string): string | undefined {
+    return this.data[chatId]?.model;
+  }
+
+  setModel(chatId: string, model: string | undefined): void {
+    this.setPreference(chatId, 'model', model);
+  }
+
+  getReasoningEffort(chatId: string): string | undefined {
+    return this.data[chatId]?.reasoningEffort;
+  }
+
+  setReasoningEffort(chatId: string, effort: string | undefined): void {
+    this.setPreference(chatId, 'reasoningEffort', effort);
+  }
+
   async flush(): Promise<void> {
     await this.saving;
   }
@@ -144,5 +189,29 @@ export class SessionStore {
       .catch((err: unknown) => {
         log.fail('session', err, { step: 'persist' });
       });
+  }
+
+  private setPreference(
+    chatId: string,
+    key: 'model' | 'reasoningEffort',
+    value: string | undefined,
+  ): void {
+    const prev = this.data[chatId];
+    const next: SessionEntry = { ...(prev ?? {}), updatedAt: Date.now() };
+    const normalized = value?.trim();
+    if (normalized) next[key] = normalized;
+    else delete next[key];
+    if (
+      !next.sessionId &&
+      !next.cwd &&
+      next.idleTimeoutMinutes === undefined &&
+      next.model === undefined &&
+      next.reasoningEffort === undefined
+    ) {
+      delete this.data[chatId];
+    } else {
+      this.data[chatId] = next;
+    }
+    this.schedulePersist();
   }
 }
