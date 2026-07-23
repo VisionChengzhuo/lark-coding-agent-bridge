@@ -3,6 +3,23 @@ set -euo pipefail
 
 export PATH="/ytech_m2v5_hdd/tcz/.local/bin:${PATH}"
 export CODEX_HOME="/ytech_m2v5_hdd/tcz/.codex"
+PROFILE="gpu-fable"
+SESSION="kml-fable-bridge"
+ROOT_DIR="/ytech_m2v5_hdd/tcz/lyc/lark-coding-agent-bridge"
+LOG_DIR="/root/.lark-channel/profiles/${PROFILE}/logs/tmux"
+BRIDGE_LOG="${LOG_DIR}/bridge.log"
+SUPERVISOR_LOG="${LOG_DIR}/supervisor.log"
+PROFILE_ENV_FILE="/root/.lark-channel/profiles/${PROFILE}/bridge.env"
+
+if [[ -r "${PROFILE_ENV_FILE}" ]]; then
+  [[ "$(stat -c '%a' "${PROFILE_ENV_FILE}")" == "600" ]] || {
+    echo "refusing non-private profile env: ${PROFILE_ENV_FILE}" >&2
+    exit 1
+  }
+  # shellcheck disable=SC1090
+  source "${PROFILE_ENV_FILE}"
+fi
+
 # Preserve the existing proxy configuration while normalizing the aliases
 # used by Node, axios, and the Feishu SDK; no proxy value is defined here.
 if [[ -n "${http_proxy:-}" && -z "${HTTP_PROXY:-}" ]]; then export HTTP_PROXY="${http_proxy}"; fi
@@ -15,13 +32,6 @@ case " ${NODE_OPTIONS:-} " in
   *" --use-env-proxy "*) ;;
   *) export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--use-env-proxy" ;;
 esac
-
-PROFILE="gpu-fable"
-SESSION="kml-fable-bridge"
-ROOT_DIR="/ytech_m2v5_hdd/tcz/lyc/lark-coding-agent-bridge"
-LOG_DIR="/root/.lark-channel/profiles/${PROFILE}/logs/tmux"
-BRIDGE_LOG="${LOG_DIR}/bridge.log"
-SUPERVISOR_LOG="${LOG_DIR}/supervisor.log"
 
 sync_inherited_environment() {
   local name
