@@ -52,9 +52,12 @@ describe('agent model catalog', () => {
     expect(resolveModelArg('claude', undefined)).toBe(DEFAULT_CLAUDE_MODEL);
   });
 
-  it('resolves the concise Feishu fable alias only for Claude profiles', () => {
+  it('resolves concise Feishu model aliases only for Claude profiles', () => {
     expect(resolveModelSelection('claude', 'fable')).toBe(DEFAULT_CLAUDE_MODEL);
     expect(resolveModelSelection('claude', 'FABLE')).toBe(DEFAULT_CLAUDE_MODEL);
+    expect(resolveModelSelection('claude', 'claude-opus-4-6')).toBe('pa/claude-opus-4-6');
+    expect(resolveModelSelection('claude', 'claude-opus-4-7')).toBe('pa/claude-opus-4-7');
+    expect(resolveModelSelection('claude', 'claude-opus-4-8')).toBe('pa/claude-opus-4-8');
     expect(resolveModelSelection('claude', DEFAULT_CLAUDE_MODEL)).toBe(DEFAULT_CLAUDE_MODEL);
     expect(resolveModelSelection('codex', 'fable')).toBeUndefined();
     expect(resolveModelSelection('claude', 'unknown')).toBeUndefined();

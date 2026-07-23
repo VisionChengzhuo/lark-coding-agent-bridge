@@ -39,6 +39,13 @@ const CODEX_MODELS: ModelOption[] = [
   { value: 'o3', label: 'o3' },
 ];
 
+const CLAUDE_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  fable: DEFAULT_CLAUDE_MODEL,
+  'claude-opus-4-6': 'pa/claude-opus-4-6',
+  'claude-opus-4-7': 'pa/claude-opus-4-7',
+  'claude-opus-4-8': 'pa/claude-opus-4-8',
+};
+
 /** The model picker options for a profile's agent kind. */
 export function supportedModels(agentKind: AgentKind): ModelOption[] {
   return agentKind === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
@@ -55,8 +62,9 @@ export function resolveModelSelection(
   value: string,
 ): string | undefined {
   if (value === DEFAULT_MODEL) return DEFAULT_MODEL;
-  if (agentKind === 'claude' && value.toLowerCase() === 'fable') {
-    return DEFAULT_CLAUDE_MODEL;
+  if (agentKind === 'claude') {
+    const alias = CLAUDE_MODEL_ALIASES[value.toLowerCase()];
+    if (alias) return alias;
   }
   return supportedModels(agentKind).some((model) => model.value === value) ? value : undefined;
 }
