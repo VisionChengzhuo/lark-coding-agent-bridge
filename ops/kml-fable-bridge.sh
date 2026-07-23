@@ -3,6 +3,14 @@ set -euo pipefail
 
 export PATH="/ytech_m2v5_hdd/tcz/.local/bin:${PATH}"
 export CODEX_HOME="/ytech_m2v5_hdd/tcz/.codex"
+# Preserve the existing proxy configuration while normalizing the aliases
+# used by Node, axios, and the Feishu SDK; no proxy value is defined here.
+if [[ -n "${http_proxy:-}" && -z "${HTTP_PROXY:-}" ]]; then export HTTP_PROXY="${http_proxy}"; fi
+if [[ -n "${https_proxy:-}" && -z "${HTTPS_PROXY:-}" ]]; then export HTTPS_PROXY="${https_proxy}"; fi
+if [[ -n "${no_proxy:-}" && -z "${NO_PROXY:-}" ]]; then export NO_PROXY="${no_proxy}"; fi
+if [[ -n "${HTTP_PROXY:-}" && -z "${http_proxy:-}" ]]; then export http_proxy="${HTTP_PROXY}"; fi
+if [[ -n "${HTTPS_PROXY:-}" && -z "${https_proxy:-}" ]]; then export https_proxy="${HTTPS_PROXY}"; fi
+if [[ -n "${NO_PROXY:-}" && -z "${no_proxy:-}" ]]; then export no_proxy="${NO_PROXY}"; fi
 case " ${NODE_OPTIONS:-} " in
   *" --use-env-proxy "*) ;;
   *) export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--use-env-proxy" ;;
