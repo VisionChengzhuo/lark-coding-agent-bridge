@@ -4,7 +4,12 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
-import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
+import {
+  DEFAULT_MODEL,
+  normalizeModelSelection,
+  resolveModelSelection,
+  supportedModels,
+} from '../agent/models';
 import type { AgentAdapter, AgentModelOption } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
@@ -1755,10 +1760,10 @@ async function handleModel(args: string, ctx: CommandContext): Promise<void> {
   const models = await loadModels(ctx);
   if (!models) return;
 
-  const value = args.trim();
+  const requestedValue = args.trim();
   const scopeModel = ctx.sessions.getModel(ctx.scope);
   const effective = effectiveCatalogModel(ctx, models, scopeModel);
-  if (!value) {
+  if (!requestedValue) {
     const options = models.map((model) => `- \`${model.value}\` — ${model.label}`).join('\n');
     await reply(
       ctx,
@@ -1766,8 +1771,12 @@ async function handleModel(args: string, ctx: CommandContext): Promise<void> {
     );
     return;
   }
-  if (value !== DEFAULT_MODEL && !models.some((model) => model.value === value)) {
-    await reply(ctx, `未知模型：\`${value}\`。请点击 \`/model\` 下拉菜单查看可选值。`);
+  const value =
+    ctx.controls.profileConfig.agentKind === 'claude'
+      ? resolveModelSelection('claude', requestedValue)
+      : requestedValue;
+  if (!value || (value !== DEFAULT_MODEL && !models.some((model) => model.value === value))) {
+    await reply(ctx, `未知模型：\`${requestedValue}\`。请点击 \`/model\` 下拉菜单查看可选值。`);
     return;
   }
 

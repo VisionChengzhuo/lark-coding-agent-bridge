@@ -61,7 +61,18 @@ describe('Codex model commands', () => {
   });
 });
 
-async function createHarness(): Promise<{
+describe('Claude model commands', () => {
+  it('maps the native /model fable menu entry to the complete provider model id', async () => {
+    const h = await createHarness('claude');
+
+    await h.command('/model fable');
+
+    expect(h.sessions.getModel('oc_dm')).toBe('pa/claude-fable-5');
+    expect(h.lastMarkdown()).toContain('Fable 5（默认）');
+  });
+});
+
+async function createHarness(agentKind: 'codex' | 'claude' = 'codex'): Promise<{
   tmp: TmpProfile;
   channel: ReturnType<typeof createFakeChannel>;
   sessions: SessionStore;
@@ -74,7 +85,7 @@ async function createHarness(): Promise<{
   const workspaces = new WorkspaceStore(join(tmp.profile, 'workspaces.json'));
   const activeRuns = new ActiveRuns();
   const profileConfig = createDefaultProfileConfig({
-    agentKind: 'codex',
+    agentKind,
     accounts: { app: { id: 'app-id', secret: 'secret', tenant: 'feishu' } },
     codex: { binaryPath: 'codex' },
   });

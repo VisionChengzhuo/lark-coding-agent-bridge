@@ -6,6 +6,7 @@ import {
   modelLabel,
   normalizeModelSelection,
   resolveModelArg,
+  resolveModelSelection,
   supportedModels,
 } from '../../../src/agent/models.js';
 
@@ -49,6 +50,14 @@ describe('agent model catalog', () => {
     // Cross-agent value → no flag rather than a broken model.
     expect(resolveModelArg('codex', 'pa/claude-opus-4-8')).toBeUndefined();
     expect(resolveModelArg('claude', undefined)).toBe(DEFAULT_CLAUDE_MODEL);
+  });
+
+  it('resolves the concise Feishu fable alias only for Claude profiles', () => {
+    expect(resolveModelSelection('claude', 'fable')).toBe(DEFAULT_CLAUDE_MODEL);
+    expect(resolveModelSelection('claude', 'FABLE')).toBe(DEFAULT_CLAUDE_MODEL);
+    expect(resolveModelSelection('claude', DEFAULT_CLAUDE_MODEL)).toBe(DEFAULT_CLAUDE_MODEL);
+    expect(resolveModelSelection('codex', 'fable')).toBeUndefined();
+    expect(resolveModelSelection('claude', 'unknown')).toBeUndefined();
   });
 
   it('labels a stored value using the picker option text', () => {

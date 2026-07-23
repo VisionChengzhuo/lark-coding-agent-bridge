@@ -44,6 +44,23 @@ export function supportedModels(agentKind: AgentKind): ModelOption[] {
   return agentKind === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
 }
 
+/**
+ * Resolve a user-facing slash-command value to a supported stored value.
+ * Native Feishu menus use their visible label as the message payload, so the
+ * concise `/model fable` entry needs an explicit alias for the provider's
+ * complete model id.
+ */
+export function resolveModelSelection(
+  agentKind: AgentKind,
+  value: string,
+): string | undefined {
+  if (value === DEFAULT_MODEL) return DEFAULT_MODEL;
+  if (agentKind === 'claude' && value.toLowerCase() === 'fable') {
+    return DEFAULT_CLAUDE_MODEL;
+  }
+  return supportedModels(agentKind).some((model) => model.value === value) ? value : undefined;
+}
+
 /** True when the selection is unset or uses the generic default sentinel. */
 export function isDefaultModel(value: string | undefined): boolean {
   return !value || value === DEFAULT_MODEL;
