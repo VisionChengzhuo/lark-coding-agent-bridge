@@ -1751,8 +1751,8 @@ async function saveAccessConfig(
 // ────────────── /model + /effort — per-scope Codex controls ──────────────
 
 async function handleModel(args: string, ctx: CommandContext): Promise<void> {
-  if (!(await ensureCodexPickerContext(ctx))) return;
-  const models = await loadCodexModels(ctx);
+  if (!(await ensureModelPickerContext(ctx))) return;
+  const models = await loadModels(ctx);
   if (!models) return;
 
   const value = args.trim();
@@ -1793,8 +1793,8 @@ async function handleModel(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function handleEffort(args: string, ctx: CommandContext): Promise<void> {
-  if (!(await ensureCodexPickerContext(ctx))) return;
-  const models = await loadCodexModels(ctx);
+  if (!(await ensureModelPickerContext(ctx))) return;
+  const models = await loadModels(ctx);
   if (!models) return;
   const model = effectiveCatalogModel(ctx, models, ctx.sessions.getModel(ctx.scope));
   if (model.supportedReasoningEfforts.length === 0) {
@@ -1837,20 +1837,34 @@ async function handleEffort(args: string, ctx: CommandContext): Promise<void> {
   );
 }
 
-async function ensureCodexPickerContext(ctx: CommandContext): Promise<boolean> {
+async function ensureModelPickerContext(ctx: CommandContext): Promise<boolean> {
   if (ctx.chatMode !== 'p2p') {
-    await reply(ctx, '请在与 Mac Codex bot 的私聊中使用这个命令。');
+    await reply(ctx, '请在与 bot 的私聊中使用这个命令。');
     return false;
   }
-  if (ctx.controls.profileConfig.agentKind !== 'codex' || ctx.agent.id !== 'codex') {
-    await reply(ctx, '这个命令只适用于 Codex profile。');
-    return false;
-  }
-  if (!ctx.agent.listModels) {
+  if (ctx.controls.profileConfig.agentKind === 'codex' && !ctx.agent.listModels) {
     await reply(ctx, '当前 Codex 版本不支持读取模型列表，请升级后重试。');
     return false;
   }
   return true;
+}
+
+async function loadModels(ctx: CommandContext): Promise<AgentModelOption[] | undefined> {
+  if (ctx.controls.profileConfig.agentKind === 'claude') {
+    const efforts = ['low', 'medium', 'high', 'xhigh', 'max'].map((value) => ({
+      value,
+      description: effortLabel(value),
+    }));
+    return supportedModels('claude').map((model) => ({
+      value: model.value,
+      label: model.label,
+      description: '',
+      isDefault: model.value === DEFAULT_MODEL,
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: efforts,
+    }));
+  }
+  return loadCodexModels(ctx);
 }
 
 async function loadCodexModels(ctx: CommandContext): Promise<AgentModelOption[] | undefined> {

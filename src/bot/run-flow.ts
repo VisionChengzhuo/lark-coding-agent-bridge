@@ -167,10 +167,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
           input.profileConfig.agentKind,
           input.profileConfig.preferences.model,
         ),
-      reasoningEffort:
-        input.capability.agentId === 'codex'
-          ? input.sessions.getReasoningEffort(input.scopeId)
-          : undefined,
+      reasoningEffort: input.sessions.getReasoningEffort(input.scopeId),
       images:
         input.capability.agentId === 'codex'
           ? policy.attachments

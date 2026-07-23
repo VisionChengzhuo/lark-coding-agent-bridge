@@ -42,7 +42,7 @@ export interface AgentRunOptions {
   sessionId?: string;
   threadId?: string;
   model?: string;
-  /** Codex reasoning effort override for this turn and subsequent turns. */
+  /** Agent reasoning effort override for this turn and subsequent turns. */
   reasoningEffort?: string;
   images?: readonly string[];
   sandbox?: CodexSandboxMode;
