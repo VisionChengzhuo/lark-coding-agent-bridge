@@ -10,7 +10,11 @@ const ENDPOINTS: Record<TenantBrand, string> = {
 };
 
 const COT_UPDATE_THROTTLE_MS = 600;
+const COT_UPDATE_BATCH_MAX = 20;
 const COT_TOOL_OUTPUT_MAX = 1200;
+// Feishu caps each serialized event content at 4096 UTF-8 bytes. Keep enough
+// room for the JSON wrapper and toolCallId around the argument delta.
+const COT_TOOL_ARGS_MAX = 3500;
 const COT_TEXT_MAX = 1200;
 // Bounds every CoT HTTP call. Without it a hung message_cot endpoint pins
 // start() — which runs before any agent event is drained and before the
@@ -61,8 +65,16 @@ export class CotClient {
         ...(init.headers ?? {}),
       },
     });
-    if (!resp.ok) throw new Error(`COT HTTP ${resp.status}`);
     const text = await resp.text();
+    if (!resp.ok) {
+      const detail = safeCotErrorDetail(text);
+      const logId = resp.headers.get('x-tt-logid') ?? resp.headers.get('x-request-id');
+      throw new Error(
+        `COT HTTP ${resp.status}` +
+          (detail ? `: ${detail}` : '') +
+          (logId ? ` (log_id=${logId.slice(0, 128)})` : ''),
+      );
+    }
     if (!text) return {};
     const data = JSON.parse(text) as { code?: number; msg?: string; data?: Record<string, unknown> } & Record<string, unknown>;
     if (data.code !== undefined && data.code !== 0) {
@@ -185,7 +197,7 @@ export class CotPublisher {
     this.enqueue('RUN_STARTED', {
       threadId: this.scope,
       runId: this.runId,
-      input: { query: this.inputPreview },
+      input: { query: truncateCot(this.inputPreview, COT_TEXT_MAX) },
     });
     this.enqueue('STEP_STARTED', {
       stepId: `step-understand-${this.runId}`,
@@ -233,7 +245,7 @@ export class CotPublisher {
       if (this.buffer.length > 0 && !this.disabled) await this.flush();
       return;
     }
-    const events = this.buffer.splice(0);
+    const events = this.buffer.splice(0, COT_UPDATE_BATCH_MAX);
     if (events.length === 0) return;
     this.flushing = this.client.update(this.ref, events)
       .catch((err) => {
@@ -243,9 +255,12 @@ export class CotPublisher {
       })
       .finally(() => {
         this.flushing = undefined;
-        if (this.buffer.length > 0 && !this.disabled) this.scheduleFlush();
       });
     await this.flushing;
+    // Events can arrive while an update is in flight. Drain them in bounded
+    // batches before returning so finish() never completes the COT while
+    // buffered events are still waiting for a throttle timer.
+    if (this.buffer.length > 0 && !this.disabled) await this.flush();
   }
 }
 
@@ -310,7 +325,10 @@ export async function consumeCotEvents(
         if (detailed && evt.input !== undefined) {
           publisher.enqueue('TOOL_CALL_ARGS', {
             toolCallId,
-            delta: JSON.stringify(evt.input),
+            // Feishu rejects oversized event content with code=10001.
+            // Tool inputs (especially shell commands and patches) are the
+            // only unbounded event field in the normal mapping.
+            delta: truncateCot(JSON.stringify(evt.input), COT_TOOL_ARGS_MAX),
           });
         }
         publisher.enqueue('TOOL_CALL_END', { toolCallId });
@@ -363,7 +381,10 @@ export async function consumeCotEvents(
           });
         }
         if (evt.type === 'error') {
-          publisher.enqueue('RUN_ERROR', { message: evt.message, code: evt.terminationReason ?? 'error' });
+          publisher.enqueue('RUN_ERROR', {
+            message: truncateCot(evt.message, COT_TEXT_MAX),
+            code: evt.terminationReason ?? 'error',
+          });
           await publisher.finish('error');
         } else {
           const status = evt.terminationReason === 'normal' ? 'done' : evt.terminationReason ?? 'done';
@@ -422,9 +443,27 @@ function cotToolIcon(name: string): string {
 
 function truncateCot(value: unknown, max: number): string {
   const text = String(value ?? '');
-  return text.length > max ? `${text.slice(0, max)}...` : text;
+  const encoder = new TextEncoder();
+  if (encoder.encode(text).byteLength <= max) return text;
+  const suffix = '...';
+  const contentLimit = Math.max(0, max - encoder.encode(suffix).byteLength);
+  const chunks: string[] = [];
+  let byteLength = 0;
+  for (const character of text) {
+    const characterBytes = encoder.encode(character).byteLength;
+    if (byteLength + characterBytes > contentLimit) break;
+    chunks.push(character);
+    byteLength += characterBytes;
+  }
+  return `${chunks.join('')}${suffix}`;
 }
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+function safeCotErrorDetail(value: string): string {
+  if (!value) return '';
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.slice(0, 500);
 }

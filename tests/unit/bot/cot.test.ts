@@ -1,9 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { consumeCotEvents, CotClient, CotPublisher, cotBriefToolTitle, finalAnswerOnlyState } from '../../../src/bot/cot.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 import type { RunState } from '../../../src/card/run-state.js';
 
 describe('COT event mapping', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('publishes assistant progress text and brief tool summaries', async () => {
     const client = new FakeCotClient();
     const publisher = new CotPublisher({
@@ -55,14 +59,76 @@ describe('COT event mapping', () => {
     await publisher.start();
 
     await consumeCotEvents(iterate([
-      { type: 'tool_use', id: 'tool-1', name: 'command_execution', input: { command: 'pwd' } },
+      {
+        type: 'tool_use',
+        id: 'tool-1',
+        name: 'command_execution',
+        input: { command: 'x'.repeat(10_000) },
+      },
       { type: 'tool_result', id: 'tool-1', output: 'workspace', isError: false },
       { type: 'done', terminationReason: 'normal' },
     ]), publisher, { detail: 'detailed' });
 
     expect(client.events.map((event) => event.event_type)).toContain('TOOL_CALL_ARGS');
+    const args = client.events.find((event) => event.event_type === 'TOOL_CALL_ARGS');
+    const argsDelta = JSON.parse(args?.content ?? '{}').delta as string;
+    expect(new TextEncoder().encode(argsDelta).byteLength).toBeLessThanOrEqual(3500);
+    expect(argsDelta).toMatch(/\.\.\.$/);
     const result = client.events.find((event) => event.event_type === 'TOOL_CALL_RESULT');
     expect(JSON.parse(result?.content ?? '{}').content).toBe('workspace');
+  });
+
+  it('limits multibyte tool arguments by UTF-8 bytes', async () => {
+    const client = new FakeCotClient();
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-multibyte',
+      scope: 'oc_chat',
+      inputPreview: 'multibyte',
+    });
+    await publisher.start();
+
+    await consumeCotEvents(iterate([
+      {
+        type: 'tool_use',
+        id: 'tool-multibyte',
+        name: 'command_execution',
+        input: { command: '中🙂'.repeat(2_000) },
+      },
+      { type: 'done', terminationReason: 'normal' },
+    ]), publisher, { detail: 'detailed' });
+
+    const args = client.events.find((event) => event.event_type === 'TOOL_CALL_ARGS');
+    const argsDelta = JSON.parse(args?.content ?? '{}').delta as string;
+    expect(new TextEncoder().encode(argsDelta).byteLength).toBeLessThanOrEqual(3500);
+    expect(argsDelta).toMatch(/\.\.\.$/);
+  });
+
+  it('drains buffered events in batches of at most twenty before completion', async () => {
+    const client = new FakeCotClient();
+    const publisher = new CotPublisher({
+      client,
+      chatId: 'oc_chat',
+      originMessageId: 'om_origin',
+      runId: 'run-batched',
+      scope: 'oc_chat',
+      inputPreview: 'batch',
+    });
+    await publisher.start();
+    for (let index = 0; index < 45; index += 1) {
+      publisher.enqueue('TEXT_MESSAGE_CONTENT', {
+        messageId: 'message-batched',
+        delta: `chunk-${index}`,
+      });
+    }
+
+    await publisher.finish('done');
+
+    expect(client.updates.map((events) => events.length)).toEqual([20, 20, 7]);
+    expect(client.events).toHaveLength(47);
+    expect(client.completed).toEqual(['done']);
   });
 
   it('derives final answer state from text blocks only', () => {
@@ -163,6 +229,32 @@ describe('COT event mapping', () => {
     expect(calls[0]?.body).toMatchObject({ receive_id: 'oc_chat', origin_message_id: 'om_origin' });
   });
 
+  it('preserves a bounded Feishu error body and request id for HTTP diagnostics', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0,
+        tenant_access_token: 'test-token',
+        expire: 7200,
+      })))
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ code: 230001, msg: 'events exceed the per-request limit' }),
+        {
+          status: 400,
+          headers: { 'x-tt-logid': 'log-safe-123' },
+        },
+      ));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CotClient({ tenant: 'feishu', appId: 'app', appSecret: 'secret' });
+
+    await expect(client.update(
+      { cotId: 'cot_x', messageId: 'om_x' } as never,
+      [{ event_type: 'RUN_STARTED', content: '{}', timestamp: Date.now() }],
+    )).rejects.toThrow(
+      'COT HTTP 400: {"code":230001,"msg":"events exceed the per-request limit"} (log_id=log-safe-123)',
+    );
+  });
+
   it('marks the publisher degraded when COT updates fail', async () => {
     const client = new FakeCotClient();
     client.failUpdate = new Error('field validation failed');
@@ -189,6 +281,7 @@ describe('COT event mapping', () => {
 
 class FakeCotClient {
   events: Array<{ event_type: string; content: string; timestamp: number }> = [];
+  updates: Array<Array<{ event_type: string; content: string; timestamp: number }>> = [];
   completed: string[] = [];
   createCalls: Array<{ chatId: string; originMessageId?: string }> = [];
   failUpdate: Error | undefined;
@@ -203,6 +296,7 @@ class FakeCotClient {
 
   async update(_ref: unknown, events: readonly { event_type: string; content: string; timestamp: number }[]): Promise<void> {
     if (this.failUpdate) throw this.failUpdate;
+    this.updates.push([...events]);
     this.events.push(...events);
   }
 
