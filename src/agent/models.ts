@@ -7,6 +7,7 @@ import type { AgentKind } from '../config/profile-schema';
  * the option `value`s exactly and rejects an empty string.
  */
 export const DEFAULT_MODEL = 'default';
+export const DEFAULT_CLAUDE_MODEL = 'pa/claude-fable-5';
 
 export interface ModelOption {
   /**
@@ -19,20 +20,15 @@ export interface ModelOption {
 }
 
 /**
- * Claude Code models. Pinned to concrete version ids (Claude Code's `--model`
- * accepts the full model-id string, not just the `opus`/`sonnet` aliases) so
- * the picker names an exact model. Add new ids here when a generation ships;
- * `opusplan` is kept as the one alias with no versioned equivalent (it runs
- * Opus for planning and Sonnet for execution).
+ * Claude Code models exposed by the Fable bridge. Use the provider's complete
+ * ids: Claude's built-in short aliases can strip the `pa/` prefix and route to
+ * a different or nonexistent model on an Anthropic-compatible gateway.
  */
 const CLAUDE_MODELS: ModelOption[] = [
-  { value: DEFAULT_MODEL, label: '跟随默认（不指定）' },
-  { value: 'claude-opus-4-8', label: 'Opus 4.8（最新）' },
-  { value: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { value: 'claude-sonnet-5', label: 'Sonnet 5（最新）' },
-  { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { value: 'claude-haiku-4-5', label: 'Haiku 4.5（最新）' },
-  { value: 'opusplan', label: 'Opus Plan（规划用 Opus，执行用 Sonnet）' },
+  { value: DEFAULT_CLAUDE_MODEL, label: 'Fable 5（默认）' },
+  { value: 'pa/claude-opus-4-6', label: 'Opus 4.6' },
+  { value: 'pa/claude-opus-4-7', label: 'Opus 4.7' },
+  { value: 'pa/claude-opus-4-8', label: 'Opus 4.8' },
 ];
 
 /** Codex CLI models. Forwarded to `codex exec --model`. */
@@ -48,7 +44,7 @@ export function supportedModels(agentKind: AgentKind): ModelOption[] {
   return agentKind === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
 }
 
-/** True when the selection means "use the agent default" (no `--model`). */
+/** True when the selection is unset or uses the generic default sentinel. */
 export function isDefaultModel(value: string | undefined): boolean {
   return !value || value === DEFAULT_MODEL;
 }
@@ -56,23 +52,27 @@ export function isDefaultModel(value: string | undefined): boolean {
 /**
  * Coerce a stored model preference into a value guaranteed to be one of the
  * current agent's picker options — Feishu's `select_static` requires
- * `initial_option` to match an option value exactly. Unknown / cross-agent
- * values (e.g. a Claude alias left over after switching a profile to Codex)
- * fall back to {@link DEFAULT_MODEL}.
+ * `initial_option` to match an option value exactly. Claude profiles pin an
+ * unset or invalid selection to Fable; Codex profiles retain their generic
+ * default sentinel.
  */
 export function normalizeModelSelection(
   agentKind: AgentKind,
   value: string | undefined,
 ): string {
-  if (isDefaultModel(value)) return DEFAULT_MODEL;
+  if (isDefaultModel(value)) {
+    return agentKind === 'claude' ? DEFAULT_CLAUDE_MODEL : DEFAULT_MODEL;
+  }
   return supportedModels(agentKind).some((m) => m.value === value)
     ? (value as string)
-    : DEFAULT_MODEL;
+    : agentKind === 'claude'
+      ? DEFAULT_CLAUDE_MODEL
+      : DEFAULT_MODEL;
 }
 
 /**
- * Resolve the concrete model string to hand the agent, or `undefined` to omit
- * the `--model` flag. Cross-agent / unknown values are treated as "default".
+ * Resolve the concrete model string to hand the agent, or `undefined` for the
+ * Codex default sentinel. Claude's default resolves to the complete Fable ID.
  */
 export function resolveModelArg(
   agentKind: AgentKind,
