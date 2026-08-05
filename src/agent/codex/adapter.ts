@@ -22,6 +22,7 @@ import type {
 } from '../types';
 import {
   CodexAppServerClient,
+  CodexAppServerRpcError,
   type AppServerExit,
   type CodexAppServerTransport,
   type JsonRpcNotification,
@@ -41,13 +42,17 @@ export interface CodexAdapterOptions {
 }
 
 interface ThreadResponse {
-  thread?: { id?: unknown };
+  thread?: { id?: unknown; turns?: unknown };
   model?: unknown;
   cwd?: unknown;
 }
 
 interface TurnResponse {
   turn?: { id?: unknown };
+}
+
+interface TurnSteerResponse {
+  turnId?: unknown;
 }
 
 interface ModelListResponse {
@@ -58,6 +63,7 @@ interface ModelListResponse {
 interface TurnRuntime {
   threadId?: string;
   turnId?: string;
+  turnStartedObserved: boolean;
   terminal: boolean;
   stopRequested: boolean;
   lastError?: string;
@@ -170,6 +176,7 @@ export class CodexAdapter implements AgentAdapter {
 
     const queue = new AsyncEventQueue<AgentEvent>();
     const runtime: TurnRuntime = {
+      turnStartedObserved: false,
       terminal: false,
       stopRequested: false,
       bufferedNotifications: [],
@@ -231,30 +238,65 @@ export class CodexAdapter implements AgentAdapter {
           ...(stringValue(thread.model) ? { model: stringValue(thread.model) } : {}),
         });
 
-        const turn = await this.client.request<TurnResponse>('turn/start', {
-          threadId,
-          input: [
-            { type: 'text', text: opts.prompt, text_elements: [] },
-            ...(opts.images ?? []).map((path) => ({ type: 'localImage', path })),
-          ],
-          cwd: opts.cwd,
-          approvalPolicy: 'never',
-          sandboxPolicy: sandboxPolicy(sandbox, opts.cwd!),
-          ...(opts.model ? { model: opts.model } : {}),
-          ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
-        });
-        const turnId = stringValue(turn.turn?.id);
+        const input = [
+          { type: 'text', text: opts.prompt, text_elements: [] },
+          ...(opts.images ?? []).map((path) => ({ type: 'localImage', path })),
+        ];
+        let turnId: string | undefined;
+        const activeTurnId = opts.threadId
+          ? inProgressTurnId(thread.thread)
+          : undefined;
+        if (activeTurnId) {
+          try {
+            const steered = await this.client.request<TurnSteerResponse>('turn/steer', {
+              threadId,
+              expectedTurnId: activeTurnId,
+              input,
+            });
+            turnId = stringValue(steered.turnId) ?? activeTurnId;
+            log.info('app-server', 'turn-steered', { turnId: turnId.slice(-8) });
+          } catch (error) {
+            // The active turn can finish between thread/resume and turn/steer.
+            // A rejected precondition means the prompt was not accepted, so it
+            // is safe to fall through and start a fresh turn instead.
+            if (!(error instanceof CodexAppServerRpcError)) throw error;
+            log.info('app-server', 'turn-steer-raced', { turnId: activeTurnId.slice(-8) });
+          }
+        }
+        if (!turnId) {
+          const turn = await this.client.request<TurnResponse>('turn/start', {
+            threadId,
+            input,
+            cwd: opts.cwd,
+            approvalPolicy: 'never',
+            sandboxPolicy: sandboxPolicy(sandbox, opts.cwd!),
+            ...(opts.model ? { model: opts.model } : {}),
+            ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
+          });
+          turnId = stringValue(turn.turn?.id);
+        }
         if (!turnId) throw new Error('codex app-server returned no turn id');
         runtime.turnId = turnId;
-        queue.push({ type: 'system', threadId, turnId, cwd: opts.cwd });
+
+        // A resumed thread can report a different active turn id in the
+        // authoritative turn/started notification than in the turn/start
+        // response (notably after the previous turn was interrupted). Reconcile
+        // that buffered notification before exposing the accepted turn id or
+        // filtering any following deltas, otherwise the entire live stream is
+        // silently discarded as belonging to another turn.
+        const buffered = runtime.bufferedNotifications.splice(0);
+        for (const notification of buffered) {
+          this.reconcileTurnStarted(notification, runtime);
+        }
+        const acceptedTurnId = runtime.turnId;
+        queue.push({ type: 'system', threadId, turnId: acceptedTurnId, cwd: opts.cwd });
 
         try {
-          await opts.onTurnAccepted?.({ threadId, turnId });
+          await opts.onTurnAccepted?.({ threadId, turnId: acceptedTurnId });
         } catch (error) {
           log.warn('context', 'cursor-commit-failed', { message: errorMessage(error) });
         }
 
-        const buffered = runtime.bufferedNotifications.splice(0);
         for (const notification of buffered) {
           this.translateNotification(notification, runtime, queue, terminal);
         }
@@ -353,14 +395,13 @@ export class CodexAdapter implements AgentAdapter {
     terminal: (event: AgentEvent) => void,
   ): void {
     if (runtime.terminal) return;
+    if (this.reconcileTurnStarted(notification, runtime)) return;
     const params = recordValue(notification.params);
     if (!params || params.threadId !== runtime.threadId) return;
     const notificationTurnId = stringValue(params.turnId) ?? stringValue(recordValue(params.turn)?.id);
     if (notificationTurnId && notificationTurnId !== runtime.turnId) return;
 
     switch (notification.method) {
-      case 'turn/started':
-        return;
       case 'item/agentMessage/delta': {
         const itemId = stringValue(params.itemId);
         const delta = stringValue(params.delta);
@@ -452,6 +493,24 @@ export class CodexAdapter implements AgentAdapter {
           log.warn('app-server', 'unknown-turn-notification', { method: notification.method });
         }
     }
+  }
+
+  private reconcileTurnStarted(notification: JsonRpcNotification, runtime: TurnRuntime): boolean {
+    if (notification.method !== 'turn/started') return false;
+    const params = recordValue(notification.params);
+    if (!params || params.threadId !== runtime.threadId) return true;
+    const startedTurnId =
+      stringValue(recordValue(params.turn)?.id) ?? stringValue(params.turnId);
+    if (!startedTurnId || runtime.turnStartedObserved) return true;
+    runtime.turnStartedObserved = true;
+    if (runtime.turnId && runtime.turnId !== startedTurnId) {
+      log.warn('app-server', 'turn-id-reconciled', {
+        expected: runtime.turnId.slice(-8),
+        actual: startedTurnId.slice(-8),
+      });
+    }
+    runtime.turnId = startedTurnId;
+    return true;
   }
 
   private appServerEnv(): NodeJS.ProcessEnv {
@@ -617,6 +676,18 @@ function appServerExitError(exit: AppServerExit): AgentEvent {
 
 function isTurnNotification(method: string): boolean {
   return method === 'error' || method.startsWith('turn/') || method.startsWith('item/');
+}
+
+function inProgressTurnId(input: unknown): string | undefined {
+  const turns = recordValue(input)?.turns;
+  if (!Array.isArray(turns)) return undefined;
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const turn = recordValue(turns[index]);
+    if (turn?.status !== 'inProgress') continue;
+    const id = stringValue(turn.id);
+    if (id) return id;
+  }
+  return undefined;
 }
 
 function recordValue(input: unknown): Record<string, unknown> | undefined {

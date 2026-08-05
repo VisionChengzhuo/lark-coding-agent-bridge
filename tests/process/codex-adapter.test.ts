@@ -20,6 +20,8 @@ class FakeAppServer implements CodexAppServerTransport {
   closed = false;
   nextThread = 1;
   nextTurn = 1;
+  nextTurnStartedId: string | undefined;
+  activeTurnId: string | undefined;
 
   async ensureStarted(): Promise<void> {
     this.started = true;
@@ -34,13 +36,30 @@ class FakeAppServer implements CodexAppServerTransport {
     }
     if (method === 'thread/resume') {
       return {
-        thread: { id: params.threadId },
+        thread: {
+          id: params.threadId,
+          turns: this.activeTurnId
+            ? [{ id: this.activeTurnId, status: 'inProgress', items: [] }]
+            : [],
+        },
         model: 'default-model',
         cwd: params.cwd,
       } as T;
     }
+    if (method === 'turn/steer') {
+      return { turnId: params.expectedTurnId } as T;
+    }
     if (method === 'turn/start') {
-      return { turn: { id: `turn-${this.nextTurn++}` } } as T;
+      const responseTurnId = `turn-${this.nextTurn++}`;
+      if (this.nextTurnStartedId) {
+        const startedTurnId = this.nextTurnStartedId;
+        this.nextTurnStartedId = undefined;
+        this.emit('turn/started', {
+          threadId: params.threadId,
+          turn: { id: startedTurnId, status: 'inProgress' },
+        });
+      }
+      return { turn: { id: responseTurnId } } as T;
     }
     if (method === 'model/list') {
       return {
@@ -291,6 +310,111 @@ describe('CodexAdapter App Server protocol', () => {
     await expect(eventsPromise).resolves.toContainEqual({
       type: 'done', threadId: 'thread-1', terminationReason: 'interrupted',
     });
+  });
+
+  it('streams a resumed turn after interrupt when turn/started corrects its id', async () => {
+    const server = new FakeAppServer();
+    const first = adapter(server).run({ runId: 'first', prompt: 'sleep', cwd: '/repo' });
+    const firstEvents = collect(first);
+    await waitForRequest(server, 'turn/start');
+    await first.stop();
+    server.emit('turn/completed', {
+      threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted' },
+    });
+    await firstEvents;
+
+    server.nextTurnStartedId = 'turn-resumed';
+    const resumed = adapter(server).run({
+      runId: 'resumed',
+      prompt: 'continue',
+      cwd: '/repo',
+      threadId: 'thread-1',
+    });
+    const resumedEvents = collect(resumed);
+    await waitForRequestCount(server, 'turn/start', 2);
+    server.emit('item/reasoning/summaryTextDelta', {
+      threadId: 'thread-1', turnId: 'turn-resumed', itemId: 'reason-1',
+      summaryIndex: 0, delta: 'checking',
+    });
+    server.emit('item/started', {
+      threadId: 'thread-1', turnId: 'turn-resumed',
+      item: { type: 'commandExecution', id: 'cmd-2', command: 'pwd', status: 'inProgress' },
+    });
+    server.emit('item/commandExecution/outputDelta', {
+      threadId: 'thread-1', turnId: 'turn-resumed', itemId: 'cmd-2', delta: '/repo\n',
+    });
+    server.emit('item/completed', {
+      threadId: 'thread-1', turnId: 'turn-resumed',
+      item: { type: 'commandExecution', id: 'cmd-2', command: 'pwd', status: 'completed' },
+    });
+    server.emit('item/completed', {
+      threadId: 'thread-1', turnId: 'turn-resumed',
+      item: { type: 'agentMessage', id: 'msg-2', text: 'RESUMED_OK' },
+    });
+    server.emit('turn/completed', {
+      threadId: 'thread-1', turn: { id: 'turn-resumed', status: 'completed' },
+    });
+
+    await expect(resumedEvents).resolves.toEqual(expect.arrayContaining([
+      { type: 'system', threadId: 'thread-1', turnId: 'turn-resumed', cwd: '/repo' },
+      { type: 'thinking', delta: 'checking' },
+      { type: 'tool_use', id: 'cmd-2', name: 'command_execution', input: { command: 'pwd' } },
+      { type: 'tool_result', id: 'cmd-2', output: '/repo\n', isError: false },
+      { type: 'final_text', content: 'RESUMED_OK' },
+      { type: 'done', threadId: 'thread-1', terminationReason: 'normal' },
+    ]));
+  });
+
+  it('steers the follow-up into an active goal turn after interrupt', async () => {
+    const server = new FakeAppServer();
+    const first = adapter(server).run({ runId: 'first-goal', prompt: 'sleep', cwd: '/repo' });
+    const firstEvents = collect(first);
+    await waitForRequest(server, 'turn/start');
+    await first.stop();
+    server.emit('turn/completed', {
+      threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted' },
+    });
+    await firstEvents;
+
+    server.activeTurnId = 'goal-turn';
+    const resumed = adapter(server).run({
+      runId: 'goal-resumed',
+      prompt: 'follow up',
+      cwd: '/repo',
+      threadId: 'thread-1',
+    });
+    const resumedEvents = collect(resumed);
+    await waitForRequest(server, 'turn/steer');
+    server.emit('item/reasoning/summaryTextDelta', {
+      threadId: 'thread-1', turnId: 'goal-turn', itemId: 'reason-goal',
+      summaryIndex: 0, delta: 'resuming goal',
+    });
+    server.emit('item/completed', {
+      threadId: 'thread-1', turnId: 'goal-turn',
+      item: { type: 'agentMessage', id: 'msg-goal', text: 'GOAL_OK' },
+    });
+    server.emit('turn/completed', {
+      threadId: 'thread-1', turn: { id: 'goal-turn', status: 'completed' },
+    });
+
+    expect(server.requests.at(-2)).toEqual({
+      method: 'thread/resume',
+      params: expect.objectContaining({ threadId: 'thread-1' }),
+    });
+    expect(server.requests.at(-1)).toEqual({
+      method: 'turn/steer',
+      params: {
+        threadId: 'thread-1',
+        expectedTurnId: 'goal-turn',
+        input: [{ type: 'text', text: 'follow up', text_elements: [] }],
+      },
+    });
+    await expect(resumedEvents).resolves.toEqual(expect.arrayContaining([
+      { type: 'system', threadId: 'thread-1', turnId: 'goal-turn', cwd: '/repo' },
+      { type: 'thinking', delta: 'resuming goal' },
+      { type: 'final_text', content: 'GOAL_OK' },
+      { type: 'done', threadId: 'thread-1', terminationReason: 'normal' },
+    ]));
   });
 
   it('isolates two concurrent turns by thread and turn id', async () => {
