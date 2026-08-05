@@ -9,13 +9,47 @@ const ENDPOINTS: Record<TenantBrand, string> = {
   lark: 'https://open.larksuite.com',
 };
 
-const COT_UPDATE_THROTTLE_MS = 600;
+export const COT_UPDATE_THROTTLE_MS = 600;
+// Keep a conservative batch size below Feishu's documented/runtime limit so
+// a burst remains valid and ordered even if the limit changes per tenant.
+export const COT_MAX_EVENTS_PER_UPDATE = 20;
+export const COT_MAX_EVENT_CONTENT_BYTES = 4096;
 const COT_TOOL_OUTPUT_MAX = 1200;
+// Feishu caps each serialized event content at 4096 UTF-8 bytes. Keep enough
+// room for the JSON wrapper and toolCallId around the argument delta.
+const COT_TOOL_ARGS_MAX = 3500;
 const COT_TEXT_MAX = 1200;
 // Bounds every CoT HTTP call. Without it a hung message_cot endpoint pins
 // start() — which runs before any agent event is drained and before the
 // plain-reply fallback — to undici's ~300s default.
 const COT_REQUEST_TIMEOUT_MS = 15_000;
+
+class CotHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, body: string, logId?: string | null) {
+    const detail = safeCotErrorDetail(body);
+    super(
+      `COT HTTP ${status}` +
+        (detail ? `: ${detail}` : '') +
+        (logId ? ` (log_id=${logId.slice(0, 128)})` : ''),
+    );
+    this.name = 'CotHttpError';
+    this.status = status;
+  }
+}
+
+class CotApiError extends Error {
+  readonly status: number;
+  readonly code: number;
+
+  constructor(status: number, code: number, message: string, body: string) {
+    super(`COT API failed: code=${code} msg=${message || '<no msg>'}: ${safeCotErrorDetail(body)}`);
+    this.name = 'CotApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
 
 export class CotClient {
   private readonly baseUrl: string;
@@ -39,10 +73,22 @@ export class CotClient {
       body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
       signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
     });
-    if (!resp.ok) throw new Error(`tenant token HTTP ${resp.status}`);
-    const data = await resp.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
+    const text = await resp.text();
+    if (!resp.ok) {
+      throw new CotHttpError(
+        resp.status,
+        text,
+        resp.headers.get('x-tt-logid') ?? resp.headers.get('x-request-id'),
+      );
+    }
+    const data = parseJson(text) as {
+      code?: number;
+      msg?: string;
+      tenant_access_token?: string;
+      expire?: number;
+    };
     if (data.code !== 0 || !data.tenant_access_token) {
-      throw new Error(`tenant token failed: code=${data.code ?? '?'} msg=${data.msg ?? '<no msg>'}`);
+      throw new CotApiError(resp.status, data.code ?? -1, data.msg ?? '', text);
     }
     this.token = data.tenant_access_token;
     const expireSeconds = typeof data.expire === 'number' ? data.expire : 7200;
@@ -50,25 +96,55 @@ export class CotClient {
     return this.token;
   }
 
-  async request(path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
-    const token = await this.tenantToken();
-    const resp = await fetch(`${this.baseUrl}${path}`, {
-      signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
-      ...init,
-      headers: {
-        'Content-Type': 'application/json;charset=utf-8',
-        Authorization: `Bearer ${token}`,
-        ...(init.headers ?? {}),
-      },
-    });
-    if (!resp.ok) throw new Error(`COT HTTP ${resp.status}`);
-    const text = await resp.text();
-    if (!text) return {};
-    const data = JSON.parse(text) as { code?: number; msg?: string; data?: Record<string, unknown> } & Record<string, unknown>;
-    if (data.code !== undefined && data.code !== 0) {
-      throw new Error(`COT API failed: code=${data.code} msg=${data.msg ?? '<no msg>'}`);
+  async request(
+    path: string,
+    init: RequestInit = {},
+    opts: { retryable?: boolean } = {},
+  ): Promise<Record<string, unknown>> {
+    let attempt = 0;
+    while (true) {
+      try {
+        const token = await this.tenantToken();
+        const resp = await fetch(`${this.baseUrl}${path}`, {
+          signal: AbortSignal.timeout(COT_REQUEST_TIMEOUT_MS),
+          ...init,
+          headers: {
+            'Content-Type': 'application/json;charset=utf-8',
+            Authorization: `Bearer ${token}`,
+            ...(init.headers ?? {}),
+          },
+        });
+        const text = await resp.text();
+        if (!resp.ok) {
+          throw new CotHttpError(
+            resp.status,
+            text,
+            resp.headers.get('x-tt-logid') ?? resp.headers.get('x-request-id'),
+          );
+        }
+        if (!text) return {};
+        const data = parseJson(text) as {
+          code?: number;
+          msg?: string;
+          data?: Record<string, unknown>;
+        } & Record<string, unknown>;
+        if (data.code !== undefined && data.code !== 0) {
+          throw new CotApiError(resp.status, data.code, data.msg ?? '', text);
+        }
+        return data.data ?? data;
+      } catch (err) {
+        if (!opts.retryable || attempt >= 2 || !isTransientCotError(err)) throw err;
+        const delayMs = [120, 300][attempt] ?? 0;
+        attempt += 1;
+        log.warn('cot', 'retrying', {
+          attempt,
+          delayMs,
+          status: statusOf(err),
+          err: diagnosticError(err),
+        });
+        await delay(delayMs);
+      }
     }
-    return data.data ?? data;
   }
 
   async create(chatId: string, originMessageId?: string): Promise<Record<string, unknown>> {
@@ -95,23 +171,30 @@ export class CotClient {
 
   async update(ref: CotRef, events: readonly CotEvent[]): Promise<void> {
     if (events.length === 0) return;
-    await this.request('/open-apis/im/v1/message_cot', {
-      method: 'PUT',
-      body: JSON.stringify({
-        cot_id: ref.cotId,
-        message_id: ref.messageId,
-        events,
-      }),
-    });
+    for (const event of events) validateCotEvent(event);
+    // Feishu rejects the whole request when the event array is too large.
+    // Sequential chunks preserve event order and avoid racing its append cursor.
+    for (let start = 0; start < events.length; start += COT_MAX_EVENTS_PER_UPDATE) {
+      const batch = events.slice(start, start + COT_MAX_EVENTS_PER_UPDATE);
+      await this.request('/open-apis/im/v1/message_cot', {
+        method: 'PUT',
+        body: JSON.stringify({
+          cot_id: ref.cotId,
+          message_id: ref.messageId,
+          events: batch,
+        }),
+      }, { retryable: true });
+    }
   }
 
   async complete(ref: CotRef, reason: string): Promise<void> {
     const cotId = encodeURIComponent(ref.cotId);
     const messageId = encodeURIComponent(ref.messageId);
-    await this.request(`/open-apis/im/v1/message_cot/complete/${cotId}?message_id=${messageId}&reason=${reason}`, {
-      method: 'POST',
-      body: '',
-    });
+    await this.request(
+      `/open-apis/im/v1/message_cot/complete/${cotId}?message_id=${messageId}&reason=${encodeURIComponent(reason)}`,
+      { method: 'POST', body: '' },
+      { retryable: true },
+    );
   }
 }
 
@@ -139,6 +222,7 @@ export class CotPublisher {
   private buffer: CotEvent[] = [];
   private flushing: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
+  private lastTimestamp = 0;
 
   constructor(opts: {
     client: Pick<CotClient, 'create' | 'update' | 'complete'>;
@@ -168,7 +252,7 @@ export class CotPublisher {
       created = await this.client.create(this.chatId, this.originMessageId);
     } catch (err) {
       this.disabled = true;
-      log.warn('cot', 'create-failed', { err: err instanceof Error ? err.message : String(err) });
+      log.warn('cot', 'create-failed', { err: diagnosticError(err) });
       return;
     }
     const cotId = stringValue(created.cot_id ?? created.cotId);
@@ -176,7 +260,7 @@ export class CotPublisher {
     if (!cotId || !messageId) {
       this.disabled = true;
       log.warn('cot', 'create-failed', {
-        err: `CreateCOT missing ids: ${JSON.stringify(created).slice(0, 200)}`,
+        err: `CreateCOT missing ids: ${diagnosticResponse(JSON.stringify(created))}`,
       });
       return;
     }
@@ -185,7 +269,7 @@ export class CotPublisher {
     this.enqueue('RUN_STARTED', {
       threadId: this.scope,
       runId: this.runId,
-      input: { query: this.inputPreview },
+      input: { query: truncateCot(this.inputPreview, COT_TEXT_MAX) },
     });
     this.enqueue('STEP_STARTED', {
       stepId: `step-understand-${this.runId}`,
@@ -197,8 +281,8 @@ export class CotPublisher {
     if (this.disabled || !this.ref) return;
     this.buffer.push({
       event_type: eventType,
-      content: JSON.stringify(content),
-      timestamp: Date.now(),
+      content: boundedJsonContent(content),
+      timestamp: this.nextTimestamp(),
     });
     this.scheduleFlush();
   }
@@ -214,8 +298,14 @@ export class CotPublisher {
       await this.client.complete(this.ref, reason);
       log.info('cot', 'completed', { cotId: this.ref.cotId, reason });
     } catch (err) {
-      log.warn('cot', 'complete-failed', { err: err instanceof Error ? err.message : String(err) });
+      log.warn('cot', 'complete-failed', { err: diagnosticError(err) });
     }
+  }
+
+  private nextTimestamp(): number {
+    const now = Date.now();
+    this.lastTimestamp = Math.max(now, this.lastTimestamp + 1);
+    return this.lastTimestamp;
   }
 
   private scheduleFlush(): void {
@@ -233,19 +323,22 @@ export class CotPublisher {
       if (this.buffer.length > 0 && !this.disabled) await this.flush();
       return;
     }
-    const events = this.buffer.splice(0);
+    const events = this.buffer.splice(0, COT_MAX_EVENTS_PER_UPDATE);
     if (events.length === 0) return;
     this.flushing = this.client.update(this.ref, events)
       .catch((err) => {
         this.disabled = true;
-        this.degradedReason = err instanceof Error ? err.message : String(err);
+        this.degradedReason = diagnosticError(err);
         log.warn('cot', 'update-failed', { err: this.degradedReason });
       })
       .finally(() => {
         this.flushing = undefined;
-        if (this.buffer.length > 0 && !this.disabled) this.scheduleFlush();
       });
     await this.flushing;
+    // Events can arrive while an update is in flight. Drain them in bounded
+    // batches before returning so finish() never completes the COT while
+    // buffered events are still waiting for a throttle timer.
+    if (this.buffer.length > 0 && !this.disabled) await this.flush();
   }
 }
 
@@ -310,7 +403,10 @@ export async function consumeCotEvents(
         if (detailed && evt.input !== undefined) {
           publisher.enqueue('TOOL_CALL_ARGS', {
             toolCallId,
-            delta: JSON.stringify(evt.input),
+            // Feishu rejects oversized event content with code=10001.
+            // Tool inputs (especially shell commands and patches) are the
+            // only unbounded event field in the normal mapping.
+            delta: truncateCot(JSON.stringify(evt.input), COT_TOOL_ARGS_MAX),
           });
         }
         publisher.enqueue('TOOL_CALL_END', { toolCallId });
@@ -363,7 +459,10 @@ export async function consumeCotEvents(
           });
         }
         if (evt.type === 'error') {
-          publisher.enqueue('RUN_ERROR', { message: evt.message, code: evt.terminationReason ?? 'error' });
+          publisher.enqueue('RUN_ERROR', {
+            message: truncateCot(evt.message, COT_TEXT_MAX),
+            code: evt.terminationReason ?? 'error',
+          });
           await publisher.finish('error');
         } else {
           const status = evt.terminationReason === 'normal' ? 'done' : evt.terminationReason ?? 'done';
@@ -381,7 +480,7 @@ export async function consumeCotEvents(
     closeTextIfNeeded();
     await publisher.finish('done');
   } catch (err) {
-    log.warn('cot', 'consume-failed', { err: err instanceof Error ? err.message : String(err) });
+    log.warn('cot', 'consume-failed', { err: diagnosticError(err) });
     await publisher.finish('error');
   }
 
@@ -422,9 +521,98 @@ function cotToolIcon(name: string): string {
 
 function truncateCot(value: unknown, max: number): string {
   const text = String(value ?? '');
-  return text.length > max ? `${text.slice(0, max)}...` : text;
+  const encoder = new TextEncoder();
+  if (encoder.encode(text).byteLength <= max) return text;
+  const suffix = '...';
+  const contentLimit = Math.max(0, max - encoder.encode(suffix).byteLength);
+  const chunks: string[] = [];
+  let byteLength = 0;
+  for (const character of text) {
+    const characterBytes = encoder.encode(character).byteLength;
+    if (byteLength + characterBytes > contentLimit) break;
+    chunks.push(character);
+    byteLength += characterBytes;
+  }
+  return `${chunks.join('')}${suffix}`;
+}
+
+function validateCotEvent(event: CotEvent): void {
+  if (!event.event_type) throw new Error('COT event_type is empty');
+  if (typeof event.content !== 'string') throw new Error('COT event content must be a string');
+  const contentBytes = Buffer.byteLength(event.content, 'utf8');
+  if (contentBytes > COT_MAX_EVENT_CONTENT_BYTES) {
+    throw new Error(`COT event content exceeds ${COT_MAX_EVENT_CONTENT_BYTES} bytes (${contentBytes})`);
+  }
+  if (!Number.isInteger(event.timestamp) || event.timestamp < 0) {
+    throw new Error('COT event timestamp must be a non-negative integer');
+  }
+}
+
+function boundedJsonContent(value: unknown): string {
+  const json = JSON.stringify(value) ?? 'null';
+  if (Buffer.byteLength(json, 'utf8') <= COT_MAX_EVENT_CONTENT_BYTES) return json;
+
+  const marker = '…';
+  let low = 0;
+  let high = Buffer.byteLength(json, 'utf8');
+  let best = JSON.stringify({ text: marker });
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = JSON.stringify({ text: `${truncateCot(json, mid)}${marker}` });
+    if (Buffer.byteLength(candidate, 'utf8') <= COT_MAX_EVENT_CONTENT_BYTES) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return best;
+}
+
+function parseJson(text: string): Record<string, unknown> {
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`COT response was not JSON: ${String(err).slice(0, 160)}`);
+  }
 }
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+function safeCotErrorDetail(value: string): string {
+  if (!value) return '';
+  const redacted = value
+    .replace(
+      /("(?:app[_-]?secret|appSecret|tenant_access_token|access_token|authorization|token|password|credential)"\s*:\s*")[^"]*(")/gi,
+      '$1[REDACTED]$2',
+    )
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/((?:app[_-]?secret|tenant_access_token|access_token|authorization|token|password)\s*[=:]\s*)[^,;\s}]+/gi, '$1[REDACTED]');
+  const compact = redacted.replace(/\s+/g, ' ').trim();
+  return truncateCot(compact, 1000);
+}
+
+function diagnosticResponse(value: string): string {
+  return safeCotErrorDetail(value);
+}
+
+function diagnosticError(err: unknown): string {
+  return err instanceof Error ? safeCotErrorDetail(err.message) : safeCotErrorDetail(String(err));
+}
+
+function statusOf(err: unknown): number | undefined {
+  return err instanceof CotHttpError || err instanceof CotApiError ? err.status : undefined;
+}
+
+function isTransientCotError(err: unknown): boolean {
+  const status = statusOf(err);
+  if (status !== undefined) return status === 408 || status === 425 || status === 429 || status >= 500;
+  if (!(err instanceof Error)) return false;
+  return err.name === 'AbortError' || err.name === 'TimeoutError' || err.name === 'TypeError';
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

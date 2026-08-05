@@ -17,6 +17,7 @@
 - **图片 / 文件**：直接发给 bot，bridge 下载到本地后交给本机 agent 处理。
 - **卡片按钮**：`/help`、`/ws list`、`/status` 返回可点击的交互卡片。
 - **Codex 常驻运行时**：每个 Codex profile 复用一个本地 `codex app-server --listen stdio://`，`/stop` 只中断当前 turn。
+- **私聊级 Codex 控制**：`/model` 和 `/effort` 可配置为飞书输入框上方两个独立的原生下拉菜单，选项来自当前登录账号的 App Server 实时模型目录。
 - **群聊历史上下文**：普通群按 `chat_id`、话题群按 `thread_id` 有界回填，续聊只注入上次成功提交后的增量。
 - **Codex 深链接**：Codex 运行卡、结果卡、`/status` 和 `/resume` 可直接打开对应桌面会话。
 
@@ -114,6 +115,7 @@ Codex profile 不再为每条飞书消息启动 `codex exec --json`。bridge 会
 - 同一 profile 的顺序任务和不同 scope 的并发任务复用同一个 App Server PID。
 - `/new` 只解除当前 scope 的 thread 绑定；下一条消息创建新 thread，App Server PID 不变。
 - `/resume` 绑定真实 Codex thread；`/stop` 调用 `turn/interrupt`，不会用杀掉 App Server 冒充中断。
+- 如需显示原生下拉选择，请进入 **飞书开发者后台 → 机器人 → 机器人自定义菜单**。保留现有「快捷指令」一级菜单，并在其中添加 `/model`、`/effort` 两个 **发送文字消息** 子菜单作为直接入口；同时另建 `/model`、`/effort` 两个独立一级菜单，在 `/model` 下添加 `/model default`、`/model <模型>` 等子菜单，在 `/effort` 下添加 `/effort default`、`/effort <强度>` 子菜单，然后创建并发布应用版本。飞书说明菜单更新可能需要最多 5 分钟到达客户端。点击独立一级菜单会展开对应选项，选择后保存当前私聊的配置，并通过后续 `turn/start` 生效；点击「快捷指令」中的入口可查看当前设置和实时选项。
 - App Server 意外退出时，当前 turn 明确失败；下一条新任务最多启动一个新进程，不自动重放状态不明的旧 turn。
 - bridge `stop`、`unregister`、重连或正常退出时会关闭对应 App Server，超时才升级终止信号。
 
@@ -176,6 +178,8 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/ws use <name>` | 切换到命名工作空间 |
 | `/ws remove <name>` | 删除命名工作空间 |
 | `/resume` | 恢复同 agent、工作目录、权限模式兼容的历史会话 |
+| `/model [值]` | 查看或切换当前私聊使用的 Codex 模型（原生下拉菜单） |
+| `/effort [值]` | 查看或切换当前模型支持的推理强度（原生下拉菜单） |
 | `/status` | 查看 profile、agent、工作目录、会话、lark-cli 身份和运行状态 |
 | `/config` | 调整展示偏好、访问控制和 lark-cli 身份策略 |
 | `/invite user @某人` | 允许用户私聊使用 bot |

@@ -145,7 +145,9 @@ export function configFormCard(opts: ConfigFormOpts): object {
               content:
                 '**模型**\n' +
                 '_底层 agent 运行使用的模型_\n' +
-                '_「跟随默认」= 不指定,由 CLI/账号决定_',
+                (opts.agentKind === 'claude'
+                  ? '_Fable 5 为默认；切换时使用完整 Novita 模型 ID_'
+                  : '_「跟随默认」= 不指定,由 CLI/账号决定_'),
             },
             {
               tag: 'select_static',

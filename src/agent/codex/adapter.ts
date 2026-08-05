@@ -16,6 +16,7 @@ import type {
   AgentAdapter,
   AgentBotIdentity,
   AgentEvent,
+  AgentModelOption,
   AgentRun,
   AgentRunOptions,
 } from '../types';
@@ -47,6 +48,11 @@ interface ThreadResponse {
 
 interface TurnResponse {
   turn?: { id?: unknown };
+}
+
+interface ModelListResponse {
+  data?: unknown;
+  nextCursor?: unknown;
 }
 
 interface TurnRuntime {
@@ -235,6 +241,7 @@ export class CodexAdapter implements AgentAdapter {
           approvalPolicy: 'never',
           sandboxPolicy: sandboxPolicy(sandbox, opts.cwd!),
           ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
         });
         const turnId = stringValue(turn.turn?.id);
         if (!turnId) throw new Error('codex app-server returned no turn id');
@@ -300,6 +307,30 @@ export class CodexAdapter implements AgentAdapter {
   }): Promise<CodexThreadHistoryEntry[]> {
     await this.prepareCompatibilityHome();
     return listCodexThreadHistory(input, this.client);
+  }
+
+  async listModels(): Promise<AgentModelOption[]> {
+    const models: AgentModelOption[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 20; page++) {
+      const response = await this.client.request<ModelListResponse>('model/list', {
+        includeHidden: false,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      const data = Array.isArray(response.data) ? response.data : [];
+      for (const item of data) {
+        const model = parseModelOption(item);
+        if (!model || seen.has(model.value)) continue;
+        seen.add(model.value);
+        models.push(model);
+      }
+      cursor = stringValue(response.nextCursor);
+      if (!cursor) break;
+    }
+    if (models.length === 0) throw new Error('codex app-server returned no available models');
+    return models;
   }
 
   private async interrupt(runtime: TurnRuntime): Promise<void> {
@@ -469,6 +500,31 @@ export class CodexAdapter implements AgentAdapter {
       }
     }
   }
+}
+
+function parseModelOption(input: unknown): AgentModelOption | undefined {
+  const model = recordValue(input);
+  const value = stringValue(model?.model) ?? stringValue(model?.id);
+  if (!model || !value || model.hidden === true) return undefined;
+  const supportedReasoningEfforts = Array.isArray(model.supportedReasoningEfforts)
+    ? model.supportedReasoningEfforts.flatMap((input) => {
+        const effort = recordValue(input);
+        const effortValue = stringValue(effort?.reasoningEffort);
+        return effortValue
+          ? [{ value: effortValue, description: stringValue(effort?.description) ?? '' }]
+          : [];
+      })
+    : [];
+  return {
+    value,
+    label: stringValue(model.displayName) ?? value,
+    description: stringValue(model.description) ?? '',
+    isDefault: model.isDefault === true,
+    ...(stringValue(model.defaultReasoningEffort)
+      ? { defaultReasoningEffort: stringValue(model.defaultReasoningEffort) }
+      : {}),
+    supportedReasoningEfforts,
+  };
 }
 
 const VOLATILE_CODEX_HOME_ENTRIES = new Set([

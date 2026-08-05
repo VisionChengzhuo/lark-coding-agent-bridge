@@ -4,6 +4,7 @@ import type {
   NormalizedMessage,
 } from '@larksuite/channel';
 import { createLarkChannel } from '@larksuite/channel';
+import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
 import { dirname, join } from 'node:path';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
@@ -269,6 +270,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     httpTimeoutMs: 30_000,
     // Route WS + REST through HTTPS_PROXY / HTTP_PROXY when set (no-op otherwise).
     respectProxyEnv: true,
+    // Keep REST on the SDK's unmodified shared Axios instance. The channel
+    // package configures the WS proxy agent separately; leaving REST on its
+    // default instance avoids Axios applying the environment proxy twice.
+    httpInstance: defaultHttpInstance,
   };
 
   const channel = createLarkChannel(opts);

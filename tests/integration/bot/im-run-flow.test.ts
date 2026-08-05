@@ -1,7 +1,7 @@
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { claudeCapability } from '../../../src/agent/capability';
+import { claudeCapability, codexCapability } from '../../../src/agent/capability';
 import { ActiveRuns } from '../../../src/bot/active-runs';
 import { startRunFlow } from '../../../src/bot/run-flow';
 import { ProcessPool } from '../../../src/bot/process-pool';
@@ -100,9 +100,38 @@ describe('IM run flow', () => {
     expect(h.agent.runOptions[0]?.cwd).toBe(workspaceRealpath);
   });
 
+  it('passes per-scope Codex model and reasoning effort overrides to the run', async () => {
+    const h = await createHarness({ defaultWorkspace: true, agentKind: 'codex' });
+    h.sessions.setModel('chat-1', 'gpt-5.6-terra');
+    h.sessions.setReasoningEffort('chat-1', 'xhigh');
+
+    const result = await startRunFlow({
+      scopeId: 'chat-1',
+      scope: { source: 'im', chatId: 'chat-1', actorId: 'ou_user' },
+      prompt: 'hello',
+      attachments: [],
+      access: { ok: true, reason: 'allowed-user' },
+      capability: codexCapability(h.profileConfig),
+      profileConfig: h.profileConfig,
+      sessions: h.sessions,
+      workspaces: h.workspaces,
+      executor: h.executor,
+      now: 1000,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(h.agent.runOptions[0]).toMatchObject({
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
 });
 
-async function createHarness(options: { defaultWorkspace?: boolean } = {}): Promise<{
+async function createHarness(options: {
+  defaultWorkspace?: boolean;
+  agentKind?: 'claude' | 'codex';
+} = {}): Promise<{
   tmp: TmpProfile;
   agent: FakeAgentAdapter;
   executor: RunExecutor;
@@ -122,7 +151,7 @@ async function createHarness(options: { defaultWorkspace?: boolean } = {}): Prom
     now: () => 1000,
   });
   const profileConfig = createDefaultProfileConfig({
-    agentKind: 'claude',
+    agentKind: options.agentKind ?? 'claude',
     accounts: {
       app: {
         id: 'cli_test',
@@ -130,6 +159,7 @@ async function createHarness(options: { defaultWorkspace?: boolean } = {}): Prom
         tenant: 'feishu',
       },
     },
+    ...(options.agentKind === 'codex' ? { codex: { binaryPath: 'codex' } } : {}),
   });
   const sessions = new SessionStore(join(tmp.profile, 'sessions.json'));
   const workspaces = new WorkspaceStore(join(tmp.profile, 'workspaces.json'));

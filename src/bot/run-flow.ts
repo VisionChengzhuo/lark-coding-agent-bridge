@@ -161,10 +161,13 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       policy: runPolicy,
       sessionId,
       threadId,
-      model: resolveModelArg(
-        input.profileConfig.agentKind,
-        input.profileConfig.preferences.model,
-      ),
+      model:
+        input.sessions.getModel(input.scopeId) ??
+        resolveModelArg(
+          input.profileConfig.agentKind,
+          input.profileConfig.preferences.model,
+        ),
+      reasoningEffort: input.sessions.getReasoningEffort(input.scopeId),
       images:
         input.capability.agentId === 'codex'
           ? policy.attachments

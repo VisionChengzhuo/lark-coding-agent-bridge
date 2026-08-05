@@ -2,6 +2,7 @@ import type {
   AgentAdapter,
   AgentBotIdentity,
   AgentEvent,
+  AgentModelOption,
   AgentRun,
   AgentRunOptions,
 } from '../../src/agent/types.js';
@@ -69,6 +70,7 @@ export class FakeAgentAdapter implements AgentAdapter {
   #available: boolean;
   #eventRuns: AgentEvent[][];
   #waitForExitResults: boolean[];
+  #models: AgentModelOption[];
 
   constructor(options: {
     id?: string;
@@ -76,12 +78,14 @@ export class FakeAgentAdapter implements AgentAdapter {
     available?: boolean;
     events?: FakeAgentEvents;
     waitForExit?: boolean | readonly boolean[];
+    models?: AgentModelOption[];
   } = {}) {
     this.id = options.id ?? 'fake-agent';
     this.displayName = options.displayName ?? 'Fake Agent';
     this.#available = options.available ?? true;
     this.#eventRuns = normalizeEventRuns(options.events ?? []);
     this.#waitForExitResults = normalizeWaitForExitResults(options.waitForExit);
+    this.#models = options.models ?? [];
   }
 
   async isAvailable(): Promise<boolean> {
@@ -116,6 +120,14 @@ export class FakeAgentAdapter implements AgentAdapter {
 
   setWaitForExit(result: boolean | readonly boolean[]): void {
     this.#waitForExitResults = normalizeWaitForExitResults(result);
+  }
+
+  async listModels(): Promise<AgentModelOption[]> {
+    return this.#models;
+  }
+
+  setModels(models: AgentModelOption[]): void {
+    this.#models = models;
   }
 }
 

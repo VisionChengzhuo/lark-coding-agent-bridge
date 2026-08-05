@@ -17,6 +17,7 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - **Images and files**: send them to the bot directly, and the bridge downloads them locally for the agent.
 - **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
 - **Persistent Codex runtime**: each Codex profile reuses one local `codex app-server --listen stdio://`; `/stop` interrupts only the active turn.
+- **Per-DM Codex controls**: `/model` and `/effort` can be exposed as dedicated Feishu dropdown menus and use the signed-in account's live App Server model catalog.
 - **Bounded group history**: regular groups are scoped by `chat_id`, topic groups by `thread_id`, with durable incremental cursors.
 - **Codex deep links**: run, result, `/status`, and `/resume` cards can open the matching desktop thread.
 
@@ -114,6 +115,7 @@ Codex profiles no longer start `codex exec --json` for every message. The bridge
 - Sequential tasks and concurrent scopes in one profile reuse the same App Server PID.
 - `/new` clears only the scope-to-thread binding; the next message gets a new thread while the PID stays the same.
 - `/stop` calls `turn/interrupt`; it does not kill the server to simulate an interrupt.
+- To expose the controls as native dropdowns, open **Feishu Developer Console → Bot → Bot custom menu**. Keep the existing Quick Commands parent and add `/model` and `/effort` beneath it as **Send text message** submenus for direct access. Also add `/model` and `/effort` as two separate main menus: under `/model`, add submenus such as `/model default` and `/model <model>`; under `/effort`, add `/effort default` and `/effort <level>`. Create and publish an app version. Feishu notes that menu updates can take up to five minutes to reach clients. Clicking a main menu opens its choices; selecting one saves a DM-scoped override applied through later `turn/start` calls. Selecting the entries inside Quick Commands shows the current setting and live choices.
 - An unexpected server exit explicitly fails in-flight turns. The next new task may start one replacement process, but an uncertain old turn is never replayed.
 - Bridge stop, unregister, reconnect, and graceful shutdown close the profile's App Server, escalating signals only after a timeout.
 
@@ -176,6 +178,8 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/ws use <name>` | Switch to a named workspace |
 | `/ws remove <name>` | Delete a named workspace |
 | `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
+| `/model [value]` | Show or switch the Codex model for the current DM (native dropdown menu) |
+| `/effort [value]` | Show or switch a supported reasoning effort (native dropdown menu) |
 | `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
 | `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
 | `/invite user @name` | Allow a user to use the bot in DMs |

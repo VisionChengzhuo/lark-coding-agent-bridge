@@ -42,6 +42,26 @@ class FakeAppServer implements CodexAppServerTransport {
     if (method === 'turn/start') {
       return { turn: { id: `turn-${this.nextTurn++}` } } as T;
     }
+    if (method === 'model/list') {
+      return {
+        data: [
+          {
+            id: 'gpt-test',
+            model: 'gpt-test',
+            displayName: 'GPT Test',
+            description: 'Test model',
+            hidden: false,
+            isDefault: true,
+            defaultReasoningEffort: 'medium',
+            supportedReasoningEfforts: [
+              { reasoningEffort: 'low', description: 'Fast' },
+              { reasoningEffort: 'medium', description: 'Balanced' },
+            ],
+          },
+        ],
+        nextCursor: null,
+      } as T;
+    }
     if (method === 'turn/interrupt') return {} as T;
     throw new Error(`unexpected request ${method}`);
   }
@@ -144,6 +164,7 @@ describe('CodexAdapter App Server protocol', () => {
       images: ['/tmp/image.png'],
       sandbox: 'read-only',
       model: 'configured-model',
+      reasoningEffort: 'high',
     });
     const eventsPromise = collect(run);
     await waitForRequest(server, 'turn/start');
@@ -168,11 +189,34 @@ describe('CodexAdapter App Server protocol', () => {
       threadId: 'thread-old',
       cwd: '/repo',
       model: 'configured-model',
+      effort: 'high',
       sandboxPolicy: { type: 'readOnly', networkAccess: false },
       input: [
         { type: 'text', text: 'continue', text_elements: [] },
         { type: 'localImage', path: '/tmp/image.png' },
       ],
+    });
+  });
+
+  it('lists the account model catalog with supported reasoning efforts', async () => {
+    const server = new FakeAppServer();
+
+    await expect(adapter(server).listModels()).resolves.toEqual([
+      {
+        value: 'gpt-test',
+        label: 'GPT Test',
+        description: 'Test model',
+        isDefault: true,
+        defaultReasoningEffort: 'medium',
+        supportedReasoningEfforts: [
+          { value: 'low', description: 'Fast' },
+          { value: 'medium', description: 'Balanced' },
+        ],
+      },
+    ]);
+    expect(server.requests.at(-1)).toEqual({
+      method: 'model/list',
+      params: { includeHidden: false, limit: 100 },
     });
   });
 
